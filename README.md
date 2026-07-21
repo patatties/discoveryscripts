@@ -6,6 +6,6 @@ Lots of these scripts are White-box, and request via Active Directory for exampl
 # cheat sheet
 I love a good cheat sheet, so here i go :)
 
-## run a command on a system using winrm and the local domain
+#### run a command on a system using winrm and the local domain
 Invoke-Command -ComputerName localhost {netstat -ano | select-string LISTEN | Select-String :139} | Format-Table -AutoSize
 

@@ -19,7 +19,8 @@ The API key is used in this script. To make this more secure, someone else may t
 
 The files are placed in a folder at the location where this script is run. This folder contains users and their training progress data. DO NOT LEAVE IT LYING AROUND! Delete this folder when you are done with it!
 
->> data transform
+>> transform script
+
 Put the data into an understandable Excel sheet.
 
 Run this from the same directory as the fetch script.

@@ -1,0 +1,140 @@
+# Run in cloud shell with an account that has the necessary privileges.
+
+$result = @()
+
+foreach ($sub in Get-AzSubscription)
+{
+    Write-Host "Processing subscription: $($sub.Name)" -ForegroundColor Cyan
+
+    try
+    {
+        Set-AzContext -SubscriptionId $sub.Id -ErrorAction Stop | Out-Null
+    }
+    catch
+    {
+        Write-Warning "Cannot access subscription $($sub.Name)"
+        continue
+    }
+
+    foreach ($vault in Get-AzRecoveryServicesVault)
+    {
+        Write-Host "  Processing vault: $($vault.Name)" -ForegroundColor Yellow
+
+        $vaultId = $vault.Id
+
+        #
+        # Immutability instellingen
+        #
+        $immutabilityState   = "Unknown"
+        $immutabilityEnabled = $false
+        $immutabilityLocked  = $false
+
+        try
+        {
+            $immutabilityState = $vault.Properties.ImmutabilitySettings.State
+
+            if ($immutabilityState -ne "Disabled")
+            {
+                $immutabilityEnabled = $true
+            }
+
+            if ($immutabilityState -eq "Locked")
+            {
+                $immutabilityLocked = $true
+            }
+        }
+        catch
+        {
+        }
+
+        #
+        # Policies ophalen
+        #
+        $policies = Get-AzRecoveryServicesBackupProtectionPolicy `
+            -VaultId $vaultId `
+            -ErrorAction SilentlyContinue
+
+        foreach ($policy in $policies)
+        {
+            #
+            # Gekoppelde items ophalen
+            #
+            try
+            {
+                $assignedItems = Get-AzRecoveryServicesBackupItem `
+                    -Policy $policy `
+                    -VaultId $vaultId `
+                    -ErrorAction Stop
+            }
+            catch
+            {
+                $assignedItems = @()
+            }
+
+            #
+            # Retention uitlezen
+            #
+            $retentionDays   = $null
+            $retentionWeeks  = $null
+            $retentionMonths = $null
+            $retentionYears  = $null
+
+            try {
+                $retentionDays = $policy.RetentionPolicy.DailySchedule.DurationCountInDays
+            } catch {}
+
+            try {
+                $retentionWeeks = $policy.RetentionPolicy.WeeklySchedule.DurationCountInWeeks
+            } catch {}
+
+            try {
+                $retentionMonths = $policy.RetentionPolicy.MonthlySchedule.DurationCountInMonths
+            } catch {}
+
+            try {
+                $retentionYears = $policy.RetentionPolicy.YearlySchedule.DurationCountInYears
+            } catch {}
+
+            #
+            # Resultaat object
+            #
+            $result += [PSCustomObject]@{
+                Subscription        = $sub.Name
+                VaultName           = $vault.Name
+                ResourceGroup       = $vault.ResourceGroupName
+
+                ImmutabilityState   = $immutabilityState
+                ImmutabilityEnabled = $immutabilityEnabled
+                ImmutabilityLocked  = $immutabilityLocked
+
+                PolicyName          = $policy.Name
+                ItemCount           = $assignedItems.Count
+                BackupItems         = ($assignedItems.Name -join " | ")
+
+                RetentionDays       = $retentionDays
+                RetentionWeeks      = $retentionWeeks
+                RetentionMonths     = $retentionMonths
+                RetentionYears      = $retentionYears
+            }
+        }
+    }
+}
+
+#
+# CSV export
+#
+$csvFile = "/home/peter/RecoveryPolicies.csv"
+
+$result |
+Export-Csv `
+    -Path $csvFile `
+    -NoTypeInformation `
+    -Encoding UTF8
+
+Write-Host ""
+Write-Host "Export completed: $csvFile" -ForegroundColor Green
+
+#
+# Overzicht op scherm
+#
+$result | Format-Table -AutoSize

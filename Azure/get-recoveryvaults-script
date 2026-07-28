@@ -1,5 +1,4 @@
 # Run in cloud shell with an account that has the necessary privileges.
-
 $result = @()
 
 foreach ($sub in Get-AzSubscription)
@@ -31,9 +30,15 @@ foreach ($sub in Get-AzSubscription)
 
         try
         {
-            $immutabilityState = $vault.Properties.ImmutabilitySettings.State
+            $vaultResource = Get-AzResource `
+                -ResourceId $vault.Id `
+                -ExpandProperties `
+                -ErrorAction Stop
 
-            if ($immutabilityState -ne "Disabled")
+            $immutabilityState =
+                $vaultResource.Properties.securitySettings.immutabilitySettings.state
+
+            if ($immutabilityState -in @("Unlocked", "Locked"))
             {
                 $immutabilityEnabled = $true
             }
@@ -123,7 +128,7 @@ foreach ($sub in Get-AzSubscription)
 #
 # CSV export
 #
-$csvFile = "/home/peter/RecoveryPolicies.csv"
+$csvFile = "RecoveryPolicies.csv"
 
 $result |
 Export-Csv `

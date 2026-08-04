@@ -7,9 +7,14 @@
     - SMB signing enforcement
     - NTLMv1 prevention
     - GPO links and structural scope
-    - Security filtering
+    - Security filtering (including resolved group membership)
     - WMI filtering
     - Group Policy inheritance
+
+    Also produces a single-file interactive HTML dashboard that lets you
+    trace, per GPO and per OU/domain, whether a weak setting is mitigated,
+    which security groups it applies to, and (on hover) who is in those
+    groups.
 
 .DESCRIPTION
     This script is intended to be executed from a domain controller or a
@@ -28,8 +33,13 @@
     - Raw GptTmpl.inf evidence
     - Direct GPO link information
     - Structural inherited scope information
-    - Security filtering information
+    - Security filtering information, plus resolved group membership
     - WMI filter information
+    - A record of OUs/domain containers where inheritance could not be
+      evaluated, even after retries
+    - An interactive HTML dashboard (AUDIT-DASHBOARD.html) combining all
+      of the above so findings can be traced by GPO or by OU, with
+      hover tooltips showing group membership
     - SHA-256 hashes for all evidence files
     - A PowerShell transcript
     - A human-readable audit summary
@@ -40,7 +50,23 @@
     Structural scope does not automatically mean that a GPO applies to every
     object below a link. Security filtering, WMI filtering, loopback processing,
     disabled GPO sections, and client-side processing can affect final policy
-    application.
+    application. The dashboard surfaces configured settings, structural
+    scope and security filtering; it does not compute final effective
+    (resultant) policy.
+
+    Get-GPInheritance is called once per domain/OU target. In larger domains
+    this can trigger transient failures from the underlying GPMC COM layer
+    or from AD Web Services load ("Could not evaluate inheritance on this
+    object. Verify that the property exists."). This script adds a small
+    delay between calls and retries failed targets a configurable number of
+    times before giving up and recording the target as a gap in evidence.
+
+    Group membership resolution calls Get-ADGroupMember for every group
+    used in security filtering. For very large groups (e.g. Domain Users,
+    Domain Computers) this can be slow; only the first
+    -MaxGroupMembersToDisplay members are embedded in the dashboard, but
+    the full list is still written to CSV. Use -ResolveGroupMembership:$false
+    to skip this step entirely.
 
     For computer-specific proof, supplement this domain-level evidence with:
         gpresult.exe /h GPResult.html
@@ -57,6 +83,15 @@
     .\Export-GpoSecurityEvidence.ps1 `
         -OutputPath C:\AuditEvidence\GPO `
         -DomainController DC01.contoso.com
+
+.EXAMPLE
+    .\Export-GpoSecurityEvidence.ps1 `
+        -InheritanceQueryDelayMs 500 `
+        -InheritanceQueryRetryCount 3 `
+        -MaxGroupMembersToDisplay 100
+
+.EXAMPLE
+    .\Export-GpoSecurityEvidence.ps1 -ResolveGroupMembership:$false
 #>
 
 [CmdletBinding()]
@@ -71,7 +106,30 @@ param (
 
     [Parameter()]
     [ValidateNotNullOrEmpty()]
-    [string]$DomainController
+    [string]$DomainController,
+
+    [Parameter()]
+    [ValidateRange(0, 60000)]
+    [int]$InheritanceQueryDelayMs = 250,
+
+    [Parameter()]
+    [ValidateRange(0, 10)]
+    [int]$InheritanceQueryRetryCount = 2,
+
+    [Parameter()]
+    [ValidateRange(0, 60000)]
+    [int]$GpoQueryDelayMs = 50,
+
+    [Parameter()]
+    [bool]$ResolveGroupMembership = $true,
+
+    [Parameter()]
+    [ValidateRange(1, 1000)]
+    [int]$MaxGroupMembersToDisplay = 50,
+
+    [Parameter()]
+    [ValidateRange(0, 60000)]
+    [int]$GroupMembershipQueryDelayMs = 100
 )
 
 Set-StrictMode -Version 2.0
@@ -109,7 +167,7 @@ function New-SafeFileName {
         $SafeName = $SafeName.Replace([string]$Character, "_")
     }
 
-    if (:IsNullOrWhiteSpace($SafeName)) {
+    if ([string]::IsNullOrWhiteSpace($SafeName)) {
         return "Unnamed"
     }
 
@@ -161,7 +219,7 @@ function Get-InfRegistryValue {
         }
 
         if (
-            :IsNullOrWhiteSpace($TrimmedLine) -or
+            [string]::IsNullOrWhiteSpace($TrimmedLine) -or
             $TrimmedLine.StartsWith(";")
         ) {
             continue
@@ -221,7 +279,7 @@ function Get-NtlmInterpretation {
         $Value
     )
 
-    if ($null -eq $Value -or :IsNullOrWhiteSpace([string]$Value)) {
+    if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) {
         return [PSCustomObject]@{
             Status         = "Not configured"
             ClientBehavior = "Not determined from this GPO"
@@ -232,7 +290,7 @@ function Get-NtlmInterpretation {
 
     $IntegerValue = 0
 
-    if (-not :TryParse([string]$Value, [ref]$IntegerValue)) {
+    if (-not [int]::TryParse([string]$Value, [ref]$IntegerValue)) {
         return [PSCustomObject]@{
             Status          = "Unknown"
             ClientBehavior  = "Unrecognized value"
@@ -331,6 +389,49 @@ function Get-XmlText {
     return $Child.InnerText
 }
 
+function Get-FindingSeverity {
+    <#
+        Classifies a configured setting as:
+          secure   - the setting fully mitigates the weakness
+          partial  - the setting partially mitigates the weakness
+          insecure - the setting does not mitigate the weakness
+          unknown  - the value could not be classified
+    #>
+    param (
+        [Parameter(Mandatory)]
+        [string]$Category,
+
+        [Parameter()]
+        [AllowEmptyString()]
+        [string]$RegistryData,
+
+        [Parameter()]
+        [bool]$Enforced
+    )
+
+    if ($Category -eq "SMB signing") {
+        if ($Enforced) {
+            return [PSCustomObject]@{ Severity = "secure"; Label = "Signing required" }
+        }
+
+        return [PSCustomObject]@{ Severity = "insecure"; Label = "Signing not required" }
+    }
+
+    if ($Category -eq "NTLMv1") {
+        switch ($RegistryData) {
+            "5" { return [PSCustomObject]@{ Severity = "secure"; Label = "LM/NTLMv1 refused" } }
+            "4" { return [PSCustomObject]@{ Severity = "partial"; Label = "Outbound NTLMv1 prevented only" } }
+            "3" { return [PSCustomObject]@{ Severity = "partial"; Label = "Outbound NTLMv1 prevented only" } }
+            "2" { return [PSCustomObject]@{ Severity = "insecure"; Label = "NTLMv1 allowed" } }
+            "1" { return [PSCustomObject]@{ Severity = "insecure"; Label = "NTLMv1 allowed" } }
+            "0" { return [PSCustomObject]@{ Severity = "insecure"; Label = "NTLMv1 allowed" } }
+            default { return [PSCustomObject]@{ Severity = "unknown"; Label = "Unrecognized value" } }
+        }
+    }
+
+    return [PSCustomObject]@{ Severity = "unknown"; Label = "Unclassified" }
+}
+
 ###########################################################################
 # Validate required modules
 ###########################################################################
@@ -380,9 +481,18 @@ try {
     }
     else {
         $Domain = Get-ADDomain
-        $DomainController = (
-            Get-ADDomainController -Discover -Writable
-        ).HostName
+
+        # Get-ADDomainController -Discover has been observed to return a
+        # HostName property typed as ADPropertyValueCollection rather than
+        # a plain string in some environments, which Get-GPO/-Server then
+        # rejects. Get-ADDomain's PDCEmulator property is always a plain
+        # string, so it is used here instead - avoiding both the type
+        # issue and an extra AD query.
+        $DomainController = [string]$Domain.PDCEmulator
+    }
+
+    if ([string]::IsNullOrWhiteSpace($DomainController)) {
+        throw "Could not determine a domain controller to use. Specify one explicitly with -DomainController."
     }
 
     $DomainDnsRoot = $Domain.DNSRoot
@@ -390,6 +500,8 @@ try {
 
     Write-AuditLog "Domain: $DomainDnsRoot"
     Write-AuditLog "Domain controller: $DomainController"
+    Write-AuditLog "Inheritance query delay: ${InheritanceQueryDelayMs}ms, retries: $InheritanceQueryRetryCount"
+    Write-AuditLog "Group membership resolution: $ResolveGroupMembership"
 
     #######################################################################
     # Record collection metadata
@@ -411,6 +523,12 @@ try {
         Forest                = $Domain.Forest
         DomainMode            = $Domain.DomainMode
         PDCEmulator           = $Domain.PDCEmulator
+        InheritanceQueryDelayMs      = $InheritanceQueryDelayMs
+        InheritanceQueryRetryCount   = $InheritanceQueryRetryCount
+        GpoQueryDelayMs              = $GpoQueryDelayMs
+        ResolveGroupMembership       = $ResolveGroupMembership
+        MaxGroupMembersToDisplay     = $MaxGroupMembersToDisplay
+        GroupMembershipQueryDelayMs  = $GroupMembershipQueryDelayMs
     }
 
     $Metadata |
@@ -460,6 +578,7 @@ try {
 
     $PolicyResults = New-Object System.Collections.Generic.List[object]
     $RelevantGpoIds = New-Object System.Collections.Generic.HashSet[string]
+    $GptTmplAccessErrors = New-Object System.Collections.Generic.List[object]
 
     #######################################################################
     # Inspect every GPO
@@ -494,9 +613,11 @@ try {
             -ReportType Html `
             -Path $HtmlReportPath
 
+        # Use the explicitly selected domain controller for SYSVOL too.
+        # This keeps GPO metadata and raw policy evidence tied to the same DC.
         $GptTmplUncPath = (
             "\\{0}\SYSVOL\{1}\Policies\{{{2}}}\Machine\Microsoft\Windows NT\SecEdit\GptTmpl.inf" -f
-            $DomainDnsRoot,
+            $DomainController,
             $DomainDnsRoot,
             $GpoGuid
         )
@@ -505,22 +626,52 @@ try {
         $InfAvailable = $false
         $RawInfPath = ""
 
-        if (Test-Path -LiteralPath $GptTmplUncPath) {
-            $InfContent = @(
-                Get-Content `
+        try {
+            if (Test-Path -LiteralPath $GptTmplUncPath) {
+                $InfContent = @(
+                    Get-Content `
+                        -LiteralPath $GptTmplUncPath `
+                        -Encoding Unicode
+                )
+
+                $InfAvailable = $true
+                $RawInfPath = Join-Path `
+                    $Directories.RawPolicy `
+                    ($ReportBaseName + "--GptTmpl.inf")
+
+                Copy-Item `
                     -LiteralPath $GptTmplUncPath `
-                    -Encoding Unicode
+                    -Destination $RawInfPath `
+                    -Force
+            }
+        }
+        catch {
+            # SYSVOL access can fail for an individual GPO (e.g. delegated
+            # ACLs restricting read access, DFS-R replication lag, or a
+            # transient share issue) without anything being wrong with the
+            # rest of the domain. Treat this GPO's GptTmpl.inf as
+            # unavailable and keep going, rather than letting
+            # Set-StrictMode/$ErrorActionPreference abort the whole run.
+            Write-AuditLog `
+                -Level "WARNING" `
+                -Message (
+                    "Could not access GptTmpl.inf for GPO '{0}': {1}" -f
+                    $Gpo.DisplayName,
+                    $_.Exception.Message
+                )
+
+            $InfAvailable = $false
+            $InfContent = @()
+            $RawInfPath = ""
+
+            $GptTmplAccessErrors.Add(
+                [PSCustomObject]@{
+                    GpoName    = $Gpo.DisplayName
+                    GpoId      = $GpoGuid
+                    SourceFile = $GptTmplUncPath
+                    Error      = $_.Exception.Message
+                }
             )
-
-            $InfAvailable = $true
-            $RawInfPath = Join-Path `
-                $Directories.RawPolicy `
-                ($ReportBaseName + "--GptTmpl.inf")
-
-            Copy-Item `
-                -LiteralPath $GptTmplUncPath `
-                -Destination $RawInfPath `
-                -Force
         }
 
         foreach ($Target in $PolicyTargets) {
@@ -600,6 +751,8 @@ try {
                 }
             )
         }
+
+        Start-Sleep -Milliseconds $GpoQueryDelayMs
     }
 
     #######################################################################
@@ -616,6 +769,22 @@ try {
             -Path $PolicyResultsPath `
             -NoTypeInformation `
             -Encoding UTF8
+
+    $GptTmplAccessErrors |
+        Sort-Object GpoName |
+        Export-Csv `
+            -Path (Join-Path $Directories.Csv "GptTmpl-Access-Errors.csv") `
+            -NoTypeInformation `
+            -Encoding UTF8
+
+    if ($GptTmplAccessErrors.Count -gt 0) {
+        Write-AuditLog `
+            -Level "WARNING" `
+            -Message (
+                "GptTmpl.inf could not be read for {0} GPO(s). See CSV\GptTmpl-Access-Errors.csv. Configured-setting evidence for those GPOs is incomplete." -f
+                $GptTmplAccessErrors.Count
+            )
+    }
 
     #######################################################################
     # Collect direct links from GPO XML reports
@@ -706,6 +875,13 @@ try {
     #
     # Security filtering and WMI filtering must still be evaluated
     # separately.
+    #
+    # Get-GPInheritance is called once per target below. A short delay is
+    # inserted after every call, and failed calls are retried with a longer
+    # backoff, to reduce transient "Could not evaluate inheritance" errors
+    # caused by repeated rapid calls against the GPMC/ADWS layer. Targets
+    # that still fail after all retries are recorded as evidence gaps
+    # rather than silently skipped.
     #######################################################################
 
     $ScopeTargets = New-Object System.Collections.Generic.List[string]
@@ -729,49 +905,168 @@ try {
     )
 
     $StructuralScopeResults = New-Object System.Collections.Generic.List[object]
+    $InheritanceErrorResults = New-Object System.Collections.Generic.List[object]
 
     foreach ($ScopeTarget in $ScopeTargets) {
-        try {
-            $Inheritance = Get-GPInheritance `
-                -Target $ScopeTarget `
-                -Domain $DomainDnsRoot `
-                -Server $DomainController
+        $Attempt = 0
+        $Succeeded = $false
+        $LastErrorMessage = ""
+        $Inheritance = $null
+
+        do {
+            $Attempt++
+
+            try {
+                $Inheritance = Get-GPInheritance `
+                    -Target $ScopeTarget `
+                    -Domain $DomainDnsRoot `
+                    -Server $DomainController
+
+                # Get-GPInheritance occasionally returns an object that is
+                # missing expected members (a known transient GPMC/ADWS
+                # issue). Validate it here, inside the try block, so an
+                # incomplete object is treated the same as any other
+                # failure - retried, and eventually logged as an evidence
+                # gap - instead of throwing an unhandled
+                # PropertyNotFoundStrict error later that would abort the
+                # whole script under Set-StrictMode.
+                if ($null -eq $Inheritance) {
+                    throw "Get-GPInheritance returned no object for this target."
+                }
+
+                $InheritancePropertyNames = @(
+                    $Inheritance.PSObject.Properties.Name
+                )
+
+                # Depending on the installed GroupPolicy/GPMC version, the
+                # container identity can be exposed as ContainerName, Name,
+                # or Path. Accept all three representations.
+                $HasContainerIdentity = (
+                    $InheritancePropertyNames -contains "ContainerName" -or
+                    $InheritancePropertyNames -contains "Name" -or
+                    $InheritancePropertyNames -contains "Path"
+                )
+
+                $HasInheritedLinks = (
+                    $InheritancePropertyNames -contains "InheritedGpoLinks"
+                )
+
+                if (-not $HasContainerIdentity -or -not $HasInheritedLinks) {
+                    $AvailableProperties = $InheritancePropertyNames -join ", "
+
+                    throw (
+                        "Get-GPInheritance returned an object without the required properties " +
+                        "for target '$ScopeTarget'. Available properties: $AvailableProperties"
+                    )
+                }
+
+                $Succeeded = $true
+            }
+            catch {
+                $LastErrorMessage = $_.Exception.Message
+
+                if ($Attempt -le $InheritanceQueryRetryCount) {
+                    Write-AuditLog `
+                        -Level "WARNING" `
+                        -Message (
+                            "Retry {0} of {1} for '{2}' after error: {3}" -f
+                            $Attempt,
+                            $InheritanceQueryRetryCount,
+                            $ScopeTarget,
+                            $LastErrorMessage
+                        )
+
+                    Start-Sleep -Milliseconds ($InheritanceQueryDelayMs * 4)
+                }
+            }
+        } while (-not $Succeeded -and $Attempt -le $InheritanceQueryRetryCount)
+
+        if ($Succeeded) {
+            $ResolvedContainerName = ""
+            $ResolvedContainerType = ""
+
+            if ($Inheritance.PSObject.Properties.Match("ContainerName").Count -gt 0) {
+                $ResolvedContainerName = [string]$Inheritance.ContainerName
+            }
+            elseif ($Inheritance.PSObject.Properties.Match("Name").Count -gt 0) {
+                $ResolvedContainerName = [string]$Inheritance.Name
+            }
+            elseif ($Inheritance.PSObject.Properties.Match("Path").Count -gt 0) {
+                $ResolvedContainerName = [string]$Inheritance.Path
+            }
+
+            if ($Inheritance.PSObject.Properties.Match("ContainerType").Count -gt 0) {
+                $ResolvedContainerType = [string]$Inheritance.ContainerType
+            }
 
             $InheritedLinks = @($Inheritance.InheritedGpoLinks)
 
             foreach ($InheritedLink in $InheritedLinks) {
-                $InheritedGpoGuid = $InheritedLink.GpoId.ToString()
+                try {
+                    if (
+                        $null -eq $InheritedLink -or
+                        -not ($InheritedLink.PSObject.Properties.Match("GpoId").Count)
+                    ) {
+                        Write-AuditLog `
+                            -Level "WARNING" `
+                            -Message "Skipped a malformed InheritedGpoLinks entry for '$ScopeTarget'."
 
-                if (-not $RelevantGpoIds.Contains($InheritedGpoGuid)) {
-                    continue
-                }
-
-                $StructuralScopeResults.Add(
-                    [PSCustomObject]@{
-                        ScopeTarget          = $ScopeTarget
-                        ContainerName        = $Inheritance.ContainerName
-                        ContainerType        = $Inheritance.ContainerType
-                        InheritanceBlocked   = $Inheritance.GpoInheritanceBlocked
-                        GpoName              = $InheritedLink.DisplayName
-                        GpoId                = $InheritedGpoGuid
-                        LinkOrder            = $InheritedLink.Order
-                        LinkEnabled          = $InheritedLink.Enabled
-                        LinkEnforced         = $InheritedLink.Enforced
-                        StructuralResult     = "Included in InheritedGpoLinks"
-                        SecurityFilterNote   = "Security and WMI filtering not evaluated in this row"
+                        continue
                     }
-                )
+
+                    $InheritedGpoGuid = $InheritedLink.GpoId.ToString()
+
+                    if (-not $RelevantGpoIds.Contains($InheritedGpoGuid)) {
+                        continue
+                    }
+
+                    $StructuralScopeResults.Add(
+                        [PSCustomObject]@{
+                            ScopeTarget          = $ScopeTarget
+                            ContainerName        = $ResolvedContainerName
+                            ContainerType        = $ResolvedContainerType
+                            InheritanceBlocked   = $Inheritance.GpoInheritanceBlocked
+                            GpoName              = $InheritedLink.DisplayName
+                            GpoId                = $InheritedGpoGuid
+                            LinkOrder            = $InheritedLink.Order
+                            LinkEnabled          = $InheritedLink.Enabled
+                            LinkEnforced         = $InheritedLink.Enforced
+                            StructuralResult     = "Included in InheritedGpoLinks"
+                            SecurityFilterNote   = "Security and WMI filtering not evaluated in this row"
+                        }
+                    )
+                }
+                catch {
+                    Write-AuditLog `
+                        -Level "WARNING" `
+                        -Message (
+                            "Skipped a malformed GPO link entry for '{0}': {1}" -f
+                            $ScopeTarget,
+                            $_.Exception.Message
+                        )
+                }
             }
         }
-        catch {
+        else {
             Write-AuditLog `
                 -Level "WARNING" `
                 -Message (
-                    "Could not evaluate inheritance for '{0}': {1}" -f
+                    "Could not evaluate inheritance for '{0}' after {1} attempt(s): {2}" -f
                     $ScopeTarget,
-                    $_.Exception.Message
+                    $Attempt,
+                    $LastErrorMessage
                 )
+
+            $InheritanceErrorResults.Add(
+                [PSCustomObject]@{
+                    ScopeTarget = $ScopeTarget
+                    Attempts    = $Attempt
+                    Error       = $LastErrorMessage
+                }
+            )
         }
+
+        Start-Sleep -Milliseconds $InheritanceQueryDelayMs
     }
 
     $StructuralScopeResults |
@@ -780,6 +1075,23 @@ try {
             -Path (Join-Path $Directories.Csv "Relevant-GPO-Structural-Scope.csv") `
             -NoTypeInformation `
             -Encoding UTF8
+
+    $InheritanceErrorResults |
+        Sort-Object ScopeTarget |
+        Export-Csv `
+            -Path (Join-Path $Directories.Csv "Inheritance-Evaluation-Errors.csv") `
+            -NoTypeInformation `
+            -Encoding UTF8
+
+    if ($InheritanceErrorResults.Count -gt 0) {
+        Write-AuditLog `
+            -Level "WARNING" `
+            -Message (
+                "{0} of {1} domain/OU targets could not be evaluated for inheritance. See CSV\Inheritance-Evaluation-Errors.csv." -f
+                $InheritanceErrorResults.Count,
+                $ScopeTargets.Count
+            )
+    }
 
     #######################################################################
     # Collect GPO permissions and security filtering evidence
@@ -825,6 +1137,128 @@ try {
         Sort-Object GpoName, Permission, TrusteeName |
         Export-Csv `
             -Path (Join-Path $Directories.Csv "Relevant-GPO-Permissions.csv") `
+            -NoTypeInformation `
+            -Encoding UTF8
+
+    #######################################################################
+    # Resolve group membership for security filtering trustees
+    #
+    # This lets the dashboard show, on hover, who is inside a group that a
+    # GPO's settings are security-filtered to. Only trustees of type
+    # "Group" with Apply permission are resolved; well-known/built-in
+    # principals (e.g. Authenticated Users) are not AD group objects and
+    # cannot be resolved this way.
+    #######################################################################
+
+    $GroupMembershipResults = New-Object System.Collections.Generic.List[object]
+    $GroupMembershipCache = @{}
+
+    if ($ResolveGroupMembership) {
+        $UniqueGroupTrustees = @(
+            $PermissionResults |
+            Where-Object { $_.TrusteeType -eq "Group" -and $_.AppliesToGpo } |
+            Select-Object TrusteeSid, TrusteeName -Unique
+        )
+
+        Write-AuditLog "Resolving membership for $($UniqueGroupTrustees.Count) security-filtering group(s)."
+
+        foreach ($GroupTrustee in $UniqueGroupTrustees) {
+            if (
+                [string]::IsNullOrWhiteSpace($GroupTrustee.TrusteeSid) -or
+                $GroupMembershipCache.ContainsKey($GroupTrustee.TrusteeSid)
+            ) {
+                continue
+            }
+
+            try {
+                $Members = @(
+                    Get-ADGroupMember `
+                        -Identity $GroupTrustee.TrusteeSid `
+                        -Server $DomainController `
+                        -ErrorAction Stop |
+                    Sort-Object Name
+                )
+
+                $DisplayMembers = @(
+                    $Members |
+                    Select-Object -First $MaxGroupMembersToDisplay |
+                    ForEach-Object {
+                        [PSCustomObject]@{
+                            name = $_.Name
+                            type = $_.objectClass
+                        }
+                    }
+                )
+
+                $GroupMembershipCache[$GroupTrustee.TrusteeSid] = [PSCustomObject]@{
+                    resolved   = $true
+                    totalCount = $Members.Count
+                    members    = $DisplayMembers
+                    truncated  = ($Members.Count -gt $MaxGroupMembersToDisplay)
+                    error      = ""
+                }
+
+                if ($Members.Count -eq 0) {
+                    $GroupMembershipResults.Add(
+                        [PSCustomObject]@{
+                            GroupTrusteeName = $GroupTrustee.TrusteeName
+                            GroupTrusteeSid  = $GroupTrustee.TrusteeSid
+                            MemberName       = ""
+                            MemberType       = ""
+                        }
+                    )
+                }
+                else {
+                    foreach ($Member in $Members) {
+                        $GroupMembershipResults.Add(
+                            [PSCustomObject]@{
+                                GroupTrusteeName = $GroupTrustee.TrusteeName
+                                GroupTrusteeSid  = $GroupTrustee.TrusteeSid
+                                MemberName       = $Member.Name
+                                MemberType       = $Member.objectClass
+                            }
+                        )
+                    }
+                }
+            }
+            catch {
+                $GroupMembershipCache[$GroupTrustee.TrusteeSid] = [PSCustomObject]@{
+                    resolved   = $false
+                    totalCount = 0
+                    members    = @()
+                    truncated  = $false
+                    error      = $_.Exception.Message
+                }
+
+                $GroupMembershipResults.Add(
+                    [PSCustomObject]@{
+                        GroupTrusteeName = $GroupTrustee.TrusteeName
+                        GroupTrusteeSid  = $GroupTrustee.TrusteeSid
+                        MemberName       = ""
+                        MemberType       = ""
+                    }
+                )
+
+                Write-AuditLog `
+                    -Level "WARNING" `
+                    -Message (
+                        "Could not resolve membership for group '{0}': {1}" -f
+                        $GroupTrustee.TrusteeName,
+                        $_.Exception.Message
+                    )
+            }
+
+            Start-Sleep -Milliseconds $GroupMembershipQueryDelayMs
+        }
+    }
+    else {
+        Write-AuditLog "Group membership resolution skipped (-ResolveGroupMembership:`$false)."
+    }
+
+    $GroupMembershipResults |
+        Sort-Object GroupTrusteeName, MemberName |
+        Export-Csv `
+            -Path (Join-Path $Directories.Csv "Relevant-GPO-Security-Filtering-Group-Members.csv") `
             -NoTypeInformation `
             -Encoding UTF8
 
@@ -877,6 +1311,617 @@ try {
             -Path (Join-Path $Directories.Csv "Relevant-GPO-WMI-Filters.csv") `
             -NoTypeInformation `
             -Encoding UTF8
+
+    #######################################################################
+    # Build interactive HTML dashboard
+    #
+    # Combines configured findings, structural scope and security filtering
+    # (with resolved group membership) into a single browsable file so a
+    # reviewer can trace, per GPO or per OU/domain, whether a weak setting
+    # is mitigated and who it applies to.
+    #######################################################################
+
+    Write-AuditLog "Building interactive audit dashboard."
+
+    $FindingsByGpoId = @{}
+    $SecureFindingCount = 0
+    $PartialFindingCount = 0
+    $InsecureFindingCount = 0
+    $UnknownFindingCount = 0
+
+    foreach ($PolicyResult in $PolicyResults) {
+        $SeverityInfo = Get-FindingSeverity `
+            -Category $PolicyResult.Category `
+            -RegistryData $PolicyResult.RegistryData `
+            -Enforced $PolicyResult.Enforced
+
+        switch ($SeverityInfo.Severity) {
+            "secure"   { $SecureFindingCount++ }
+            "partial"  { $PartialFindingCount++ }
+            "insecure" { $InsecureFindingCount++ }
+            default    { $UnknownFindingCount++ }
+        }
+
+        $FindingEntry = [PSCustomObject]@{
+            category       = $PolicyResult.Category
+            setting        = $PolicyResult.Setting
+            registryPath   = $PolicyResult.RegistryPath
+            valueName      = $PolicyResult.ValueName
+            registryData   = $PolicyResult.RegistryData
+            severity       = $SeverityInfo.Severity
+            label          = $SeverityInfo.Label
+            interpretation = $PolicyResult.Interpretation
+            clientBehavior = $PolicyResult.ClientBehavior
+            serverBehavior = $PolicyResult.ServerBehavior
+        }
+
+        if (-not $FindingsByGpoId.ContainsKey($PolicyResult.GpoId)) {
+            $FindingsByGpoId[$PolicyResult.GpoId] = New-Object System.Collections.Generic.List[object]
+        }
+
+        $FindingsByGpoId[$PolicyResult.GpoId].Add($FindingEntry)
+    }
+
+    $FilteringByGpoId = @{}
+
+    foreach ($PermissionResult in $PermissionResults) {
+        $FilterEntry = [PSCustomObject]@{
+            trustee      = $PermissionResult.TrusteeName
+            sid          = $PermissionResult.TrusteeSid
+            domain       = $PermissionResult.TrusteeDomain
+            type         = $PermissionResult.TrusteeType
+            permission   = $PermissionResult.Permission
+            appliesToGpo = $PermissionResult.AppliesToGpo
+            inherited    = $PermissionResult.Inherited
+        }
+
+        if (-not $FilteringByGpoId.ContainsKey($PermissionResult.GpoId)) {
+            $FilteringByGpoId[$PermissionResult.GpoId] = New-Object System.Collections.Generic.List[object]
+        }
+
+        $FilteringByGpoId[$PermissionResult.GpoId].Add($FilterEntry)
+    }
+
+    $DashboardGpos = New-Object System.Collections.Generic.List[object]
+
+    foreach ($Gpo in $Gpos) {
+        $GpoGuid = $Gpo.Id.ToString()
+
+        if (-not $RelevantGpoIds.Contains($GpoGuid)) {
+            continue
+        }
+
+        $GpoFindings = @()
+        if ($FindingsByGpoId.ContainsKey($GpoGuid)) {
+            $GpoFindings = $FindingsByGpoId[$GpoGuid].ToArray()
+        }
+
+        $GpoDirectLinks = @(
+            $DirectLinkResults |
+            Where-Object { $_.GpoId -eq $GpoGuid -and $_.LinkStatus -eq "Direct link" } |
+            ForEach-Object {
+                [PSCustomObject]@{
+                    target   = $_.LinkTarget
+                    enabled  = $_.Enabled
+                    enforced = $_.Enforced
+                }
+            }
+        )
+
+        $GpoScope = @(
+            $StructuralScopeResults |
+            Where-Object { $_.GpoId -eq $GpoGuid } |
+            ForEach-Object {
+                [PSCustomObject]@{
+                    target             = $_.ScopeTarget
+                    containerName      = $_.ContainerName
+                    containerType      = $_.ContainerType
+                    inheritanceBlocked = [string]$_.InheritanceBlocked
+                    linkEnabled        = [string]$_.LinkEnabled
+                    linkEnforced       = [string]$_.LinkEnforced
+                }
+            }
+        )
+
+        $GpoFiltering = @()
+        if ($FilteringByGpoId.ContainsKey($GpoGuid)) {
+            $GpoFiltering = $FilteringByGpoId[$GpoGuid].ToArray()
+        }
+
+        $GpoWmiFilterRow = $WmiFilterResults | Where-Object { $_.GpoId -eq $GpoGuid } | Select-Object -First 1
+        $GpoWmiFilter = $null
+
+        if ($GpoWmiFilterRow -and -not [string]::IsNullOrWhiteSpace($GpoWmiFilterRow.WmiFilterName)) {
+            $GpoWmiFilter = [PSCustomObject]@{
+                name = $GpoWmiFilterRow.WmiFilterName
+                path = $GpoWmiFilterRow.WmiFilterPath
+            }
+        }
+
+        $DashboardGpos.Add(
+            [PSCustomObject]@{
+                gpoId             = $GpoGuid
+                gpoName           = $Gpo.DisplayName
+                gpoStatus         = [string]$Gpo.GpoStatus
+                modificationTime  = [string]$Gpo.ModificationTime
+                findings          = $GpoFindings
+                directLinks       = $GpoDirectLinks
+                structuralScope   = $GpoScope
+                securityFiltering = $GpoFiltering
+                wmiFilter         = $GpoWmiFilter
+            }
+        )
+    }
+
+    $DashboardScopeTargets = New-Object System.Collections.Generic.List[object]
+    $ScopeTargetGroups = @($StructuralScopeResults | Group-Object ScopeTarget)
+
+    foreach ($ScopeTargetGroup in $ScopeTargetGroups) {
+        $FirstRow = $ScopeTargetGroup.Group[0]
+
+        $LinkedGpos = @(
+            $ScopeTargetGroup.Group |
+            ForEach-Object {
+                $StructuralRow = $_
+                $RowGpoFindings = @()
+
+                if ($FindingsByGpoId.ContainsKey($StructuralRow.GpoId)) {
+                    $RowGpoFindings = $FindingsByGpoId[$StructuralRow.GpoId].ToArray()
+                }
+
+                $RowGpoFiltering = @()
+
+                if ($FilteringByGpoId.ContainsKey($StructuralRow.GpoId)) {
+                    $RowGpoFiltering = @(
+                        $FilteringByGpoId[$StructuralRow.GpoId].ToArray() |
+                        Where-Object { $_.appliesToGpo }
+                    )
+                }
+
+                [PSCustomObject]@{
+                    gpoId        = $StructuralRow.GpoId
+                    gpoName      = $StructuralRow.GpoName
+                    linkEnabled  = [string]$StructuralRow.LinkEnabled
+                    linkEnforced = [string]$StructuralRow.LinkEnforced
+                    findings     = $RowGpoFindings
+                    filtering    = $RowGpoFiltering
+                }
+            }
+        )
+
+        $DashboardScopeTargets.Add(
+            [PSCustomObject]@{
+                target             = $ScopeTargetGroup.Name
+                containerName      = $FirstRow.ContainerName
+                containerType      = $FirstRow.ContainerType
+                inheritanceBlocked = [string]$FirstRow.InheritanceBlocked
+                linkedGpos         = $LinkedGpos
+                evaluationFailed   = $false
+                evaluationError    = ""
+            }
+        )
+    }
+
+    foreach ($InheritanceError in $InheritanceErrorResults) {
+        $DashboardScopeTargets.Add(
+            [PSCustomObject]@{
+                target             = $InheritanceError.ScopeTarget
+                containerName      = ""
+                containerType      = ""
+                inheritanceBlocked = ""
+                linkedGpos         = @()
+                evaluationFailed   = $true
+                evaluationError    = $InheritanceError.Error
+            }
+        )
+    }
+
+    # Normalize generic lists before JSON serialization. This avoids a
+    # Windows PowerShell 5.1 binder issue involving List[object] values.
+    $DashboardGposArray = $DashboardGpos.ToArray()
+    $DashboardScopeTargetsArray = $DashboardScopeTargets.ToArray()
+
+    $DashboardData = [PSCustomObject]@{
+        generatedAt      = (Get-Date -Format "yyyy-MM-dd HH:mm:ss K")
+        domain           = $DomainDnsRoot
+        domainController = $DomainController
+        summary          = [PSCustomObject]@{
+            totalGposScanned   = $Gpos.Count
+            relevantGpoCount   = $RelevantGpoIds.Count
+            findingsSecure     = $SecureFindingCount
+            findingsPartial    = $PartialFindingCount
+            findingsInsecure   = $InsecureFindingCount
+            findingsUnknown    = $UnknownFindingCount
+            scopeTargetsTotal  = $ScopeTargets.Count
+            scopeTargetsFailed = $InheritanceErrorResults.Count
+        }
+        gpos             = $DashboardGposArray
+        scopeTargets     = $DashboardScopeTargetsArray
+        groupMembers     = $GroupMembershipCache
+    }
+
+    $DashboardJson = $DashboardData | ConvertTo-Json -Depth 15
+    $DashboardJsonPath = Join-Path $Directories.Metadata "Dashboard-Data.json"
+    $DashboardJson | Set-Content -LiteralPath $DashboardJsonPath -Encoding UTF8
+
+    $DashboardJsonSafe = $DashboardJson -replace '</script', '<\/script'
+
+    $DashboardHtmlTemplate = @'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>GPO Security Audit Dashboard - __DOMAIN__</title>
+<style>
+:root {
+  --bg: #f7f8fa;
+  --surface: #ffffff;
+  --border: #e2e5ea;
+  --text: #1a1d23;
+  --muted: #6b7280;
+  --accent: #2563eb;
+  --secure: #16a34a;
+  --secure-bg: #dcfce7;
+  --partial: #b45309;
+  --partial-bg: #fef3c7;
+  --insecure: #dc2626;
+  --insecure-bg: #fee2e2;
+  --unknown: #6b7280;
+  --unknown-bg: #e5e7eb;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+header { padding: 24px 32px; background: var(--surface); border-bottom: 1px solid var(--border); }
+header h1 { margin: 0 0 4px 0; font-size: 20px; }
+header .meta { color: var(--muted); font-size: 13px; }
+.summary-cards { display: flex; gap: 12px; padding: 20px 32px 0; flex-wrap: wrap; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px 18px; min-width: 160px; }
+.card-value { font-size: 26px; font-weight: 700; }
+.card-label { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.card-insecure .card-value { color: var(--insecure); }
+.card-partial .card-value { color: var(--partial); }
+.card-secure .card-value { color: var(--secure); }
+.tabs { display: flex; gap: 4px; padding: 20px 32px 0; border-bottom: 1px solid var(--border); }
+.tab-btn { border: none; background: none; padding: 10px 16px; cursor: pointer; font-size: 14px; color: var(--muted); border-bottom: 2px solid transparent; }
+.tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
+.tab-panel { display: none; padding: 20px 32px 40px; }
+.tab-panel.active { display: block; }
+.controls { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; flex-wrap: wrap; }
+.controls input[type=text] { padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; min-width: 260px; font-size: 13px; }
+.controls select { padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; font-size: 13px; }
+.controls label { font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; white-space: nowrap; }
+.badge-secure { background: var(--secure-bg); color: var(--secure); }
+.badge-partial { background: var(--partial-bg); color: var(--partial); }
+.badge-insecure { background: var(--insecure-bg); color: var(--insecure); }
+.badge-unknown { background: var(--unknown-bg); color: var(--unknown); }
+.gpo-block, .scope-block { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; margin-bottom: 10px; overflow: hidden; }
+.gpo-block summary { padding: 14px 18px; cursor: pointer; display: flex; gap: 12px; align-items: center; list-style: none; }
+.gpo-block summary::-webkit-details-marker { display: none; }
+.gpo-name { font-weight: 600; }
+.gpo-body { padding: 0 18px 18px; }
+.findings-table { width: 100%; border-collapse: collapse; margin-bottom: 14px; font-size: 13px; }
+.findings-table th, .findings-table td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+.gpo-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+.gpo-columns h4 { margin: 0 0 6px; font-size: 12px; text-transform: uppercase; color: var(--muted); }
+.gpo-columns ul { margin: 0; padding-left: 18px; font-size: 13px; }
+.scope-header { padding: 12px 16px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; border-bottom: 1px solid var(--border); }
+.scope-body { padding: 12px 16px; }
+.scope-body ul { margin: 0; padding-left: 18px; font-size: 13px; }
+.scope-body li { margin-bottom: 8px; }
+.tag { background: #eef2ff; color: var(--accent); border-radius: 999px; padding: 1px 8px; font-size: 11px; margin-left: 4px; }
+.tag-warn { background: var(--insecure-bg); color: var(--insecure); }
+.muted { color: var(--muted); font-size: 13px; }
+code { font-family: "SFMono-Regular", Consolas, monospace; font-size: 12px; }
+footer { padding: 20px 32px 40px; color: var(--muted); font-size: 12px; border-top: 1px solid var(--border); margin-top: 20px; }
+.trustee { border-bottom: 1px dotted var(--muted); cursor: help; }
+.trustee-chip { display: inline-block; background: #f1f5f9; border-radius: 999px; padding: 1px 8px; font-size: 11px; margin: 2px 4px 0 0; border-bottom: none; cursor: help; }
+.member-tooltip {
+  position: fixed;
+  z-index: 1000;
+  background: #111827;
+  color: #f9fafb;
+  padding: 10px 12px;
+  border-radius: 8px;
+  font-size: 12px;
+  max-width: 320px;
+  max-height: 260px;
+  overflow-y: auto;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+  display: none;
+  pointer-events: none;
+}
+.member-tooltip .tooltip-title { font-weight: 600; margin-bottom: 6px; }
+.member-tooltip .tooltip-muted { color: #9ca3af; }
+.member-tooltip ul.tooltip-list { margin: 0; padding-left: 16px; }
+.member-tooltip .tooltip-type { color: #9ca3af; }
+@media (max-width: 720px) { .gpo-columns { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<div id="member-tooltip" class="member-tooltip"></div>
+
+<header>
+  <h1>GPO Security Audit Dashboard</h1>
+  <div class="meta">Domain: <strong>__DOMAIN__</strong> &middot; Domain controller: <strong>__DC__</strong> &middot; Generated: __GENERATED_AT__</div>
+</header>
+
+<section class="summary-cards" id="summary-cards"></section>
+
+<nav class="tabs">
+  <button class="tab-btn active" data-tab="policies">By GPO / policy</button>
+  <button class="tab-btn" data-tab="scope">By OU / domain</button>
+</nav>
+
+<section id="tab-policies" class="tab-panel active">
+  <div class="controls">
+    <input type="text" id="policy-search" placeholder="Search GPO name, category, setting..." />
+    <select id="severity-filter">
+      <option value="all">All statuses</option>
+      <option value="insecure">Insecure only</option>
+      <option value="partial">Partially mitigated only</option>
+      <option value="secure">Secure / enforced only</option>
+      <option value="unknown">Unclassified only</option>
+    </select>
+  </div>
+  <div id="policies-container"></div>
+</section>
+
+<section id="tab-scope" class="tab-panel">
+  <div class="controls">
+    <input type="text" id="scope-search" placeholder="Search OU / domain..." />
+    <label><input type="checkbox" id="only-gaps" /> Show only OUs without full mitigation</label>
+  </div>
+  <div id="scope-container"></div>
+</section>
+
+<footer>
+  Structural scope shows domain/OU containers where a GPO appears in InheritedGpoLinks. This is not the same as
+  final effective (resultant) policy: security filtering, WMI filtering, loopback processing, disabled GPO
+  sections and client-side processing can still change what actually applies on an endpoint. Use
+  <code>gpresult /h</code> or <code>Get-GPResultantSetOfPolicy</code> for endpoint-specific proof. Rows marked
+  "Evaluation failed" could not be checked at all (even after retries) and are gaps in this evidence set, not
+  confirmed absence of a policy. Hover over an underlined group name to see its resolved membership (capped at
+  the configured maximum; the full list is in the CSV evidence).
+</footer>
+
+<script>
+const data = __DASHBOARD_JSON__;
+const groupMembers = data.groupMembers || {};
+const tooltip = document.getElementById('member-tooltip');
+
+function esc(s) {
+  if (s === null || s === undefined) return '';
+  return String(s)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;');
+}
+
+const severityOrder = { secure: 0, partial: 1, insecure: 2, unknown: 3 };
+const severityLabel = {
+  secure: 'Secure / enforced',
+  partial: 'Partially mitigated',
+  insecure: 'Insecure',
+  unknown: 'Unclassified'
+};
+
+function badge(sev, text) {
+  const safeSev = sev && severityLabel[sev] ? sev : 'unknown';
+  return '<span class="badge badge-' + esc(safeSev) + '">' + esc(text || severityLabel[safeSev]) + '</span>';
+}
+
+function bestSeverity(findings) {
+  if (!findings || findings.length === 0) return null;
+  return findings.reduce((best, f) => severityOrder[f.severity] < severityOrder[best] ? f.severity : best, findings[0].severity);
+}
+
+function trusteeSpan(sid, name, cssClass) {
+  return '<span class="' + cssClass + ' trustee" data-sid="' + esc(sid) + '" data-name="' + esc(name) + '">' + esc(name) + '</span>';
+}
+
+function tooltipContentForSid(sid, trusteeName) {
+  const info = groupMembers[sid];
+
+  if (!info) {
+    return '<div class="tooltip-title">' + esc(trusteeName) + '</div><div class="tooltip-muted">Not a resolved AD group (built-in/well-known principal, or resolution was skipped)</div>';
+  }
+  if (!info.resolved) {
+    return '<div class="tooltip-title">' + esc(trusteeName) + '</div><div class="tooltip-muted">Could not resolve membership: ' + esc(info.error) + '</div>';
+  }
+  if (info.totalCount === 0) {
+    return '<div class="tooltip-title">' + esc(trusteeName) + '</div><div class="tooltip-muted">Group has no members</div>';
+  }
+
+  const list = info.members.map(m => '<li>' + esc(m.name) + ' <span class="tooltip-type">(' + esc(m.type) + ')</span></li>').join('');
+  const more = info.truncated ? '<li class="tooltip-muted">+ ' + (info.totalCount - info.members.length) + ' more (see CSV for full list)</li>' : '';
+
+  return '<div class="tooltip-title">' + esc(trusteeName) + ' &middot; ' + info.totalCount + ' member(s)</div><ul class="tooltip-list">' + list + more + '</ul>';
+}
+
+function renderSummary() {
+  const s = data.summary;
+  document.getElementById('summary-cards').innerHTML =
+    '<div class="card"><div class="card-value">' + s.relevantGpoCount + '</div><div class="card-label">GPOs with relevant settings</div></div>' +
+    '<div class="card card-insecure"><div class="card-value">' + s.findingsInsecure + '</div><div class="card-label">Insecure findings</div></div>' +
+    '<div class="card card-partial"><div class="card-value">' + s.findingsPartial + '</div><div class="card-label">Partially mitigated</div></div>' +
+    '<div class="card card-secure"><div class="card-value">' + s.findingsSecure + '</div><div class="card-label">Enforced / secure</div></div>' +
+    '<div class="card"><div class="card-value">' + (s.scopeTargetsTotal - s.scopeTargetsFailed) + '/' + s.scopeTargetsTotal + '</div><div class="card-label">OUs successfully evaluated</div></div>';
+}
+
+function renderPolicies(filterText, severityFilter) {
+  const container = document.getElementById('policies-container');
+  const term = filterText.trim().toLowerCase();
+  let html = '';
+
+  data.gpos.forEach(gpo => {
+    let findings = gpo.findings;
+    if (severityFilter !== 'all') findings = findings.filter(f => f.severity === severityFilter);
+    if (findings.length === 0) return;
+
+    const matchesText = !term ||
+      gpo.gpoName.toLowerCase().includes(term) ||
+      findings.some(f => (f.category + ' ' + f.setting).toLowerCase().includes(term));
+    if (!matchesText) return;
+
+    const findingsHtml = findings.map(f =>
+      '<tr><td>' + esc(f.category) + '</td><td>' + esc(f.setting) + '</td><td><code>' + esc(f.registryData) + '</code></td><td>' + badge(f.severity, f.label) + '</td><td>' + esc(f.interpretation) + '</td></tr>'
+    ).join('');
+
+    const scopeHtml = gpo.structuralScope.length
+      ? gpo.structuralScope.map(s =>
+          '<li><code>' + esc(s.target) + '</code>' +
+          (s.linkEnforced === 'True' ? ' <span class="tag">enforced</span>' : '') +
+          (s.inheritanceBlocked === 'Yes' ? ' <span class="tag tag-warn">inheritance blocked</span>' : '') +
+          '</li>'
+        ).join('')
+      : '<li class="muted">No structural scope evaluated / no matches found</li>';
+
+    const filteringRows = gpo.securityFiltering.filter(p => p.appliesToGpo);
+    const filteringHtml = filteringRows.length
+      ? filteringRows.map(p =>
+          '<li>' + trusteeSpan(p.sid, p.trustee, 'trustee-inline') + ' <span class="muted">(' + esc(p.type) + ')</span></li>'
+        ).join('')
+      : '<li class="muted">No Apply permissions recorded</li>';
+
+    const wmiHtml = gpo.wmiFilter
+      ? '<div><strong>WMI filter:</strong> ' + esc(gpo.wmiFilter.name) + '</div>'
+      : '';
+
+    html +=
+      '<details class="gpo-block"><summary><span class="gpo-name">' + esc(gpo.gpoName) + '</span><span class="gpo-status muted">' + esc(gpo.gpoStatus) + '</span></summary>' +
+      '<div class="gpo-body">' +
+      '<table class="findings-table"><thead><tr><th>Category</th><th>Setting</th><th>Value</th><th>Status</th><th>Interpretation</th></tr></thead><tbody>' + findingsHtml + '</tbody></table>' +
+      '<div class="gpo-columns">' +
+      '<div><h4>Applies at (structural scope)</h4><ul>' + scopeHtml + '</ul></div>' +
+      '<div><h4>Security filtering (Apply permission)</h4><ul>' + filteringHtml + '</ul></div>' +
+      '</div>' + wmiHtml +
+      '</div></details>';
+  });
+
+  container.innerHTML = html || '<p class="muted">No GPOs match the current filters.</p>';
+}
+
+function renderScope(filterText, onlyGaps) {
+  const container = document.getElementById('scope-container');
+  const term = filterText.trim().toLowerCase();
+  let html = '';
+
+  data.scopeTargets.forEach(scope => {
+    if (term && !scope.target.toLowerCase().includes(term) && !(scope.containerName || '').toLowerCase().includes(term)) return;
+
+    if (scope.evaluationFailed) {
+      if (onlyGaps) return;
+      html +=
+        '<div class="scope-block"><div class="scope-header"><code>' + esc(scope.target) + '</code>' + badge('unknown', 'Evaluation failed') + '</div>' +
+        '<div class="scope-body muted">' + esc(scope.evaluationError) + '</div></div>';
+      return;
+    }
+
+    const smbFindings = scope.linkedGpos.flatMap(g => g.findings.filter(f => f.category === 'SMB signing'));
+    const ntlmFindings = scope.linkedGpos.flatMap(g => g.findings.filter(f => f.category === 'NTLMv1'));
+    const smbBest = bestSeverity(smbFindings);
+    const ntlmBest = bestSeverity(ntlmFindings);
+    const hasGap = smbBest !== 'secure' || ntlmBest !== 'secure';
+
+    if (onlyGaps && !hasGap) return;
+
+    const gposHtml = scope.linkedGpos.length
+      ? scope.linkedGpos.map(g => {
+          const findingBadges = g.findings.map(f => badge(f.severity, f.category + ': ' + f.label)).join(' ');
+          const filterChips = (g.filtering || []).map(p => trusteeSpan(p.sid, p.trustee, 'trustee-chip')).join('');
+
+          return '<li><strong>' + esc(g.gpoName) + '</strong>' +
+            (g.linkEnforced === 'True' ? ' <span class="tag">enforced</span>' : '') +
+            (g.linkEnabled === 'False' ? ' <span class="tag tag-warn">link disabled</span>' : '') +
+            '<div>' + findingBadges + '</div>' +
+            (filterChips ? '<div class="muted" style="margin-top:4px;">Applies to: ' + filterChips + '</div>' : '') +
+            '</li>';
+        }).join('')
+      : '<li class="muted">No GPOs with relevant settings found in scope</li>';
+
+    html +=
+      '<div class="scope-block"><div class="scope-header"><code>' + esc(scope.target) + '</code>' +
+      '<span class="tag">' + esc(scope.containerType) + '</span>' +
+      (scope.inheritanceBlocked === 'Yes' ? '<span class="tag tag-warn">inheritance blocked</span>' : '') +
+      badge(smbBest || 'unknown', 'SMB: ' + (smbBest ? severityLabel[smbBest] : 'no policy scoped')) +
+      badge(ntlmBest || 'unknown', 'NTLM: ' + (ntlmBest ? severityLabel[ntlmBest] : 'no policy scoped')) +
+      '</div><div class="scope-body"><ul>' + gposHtml + '</ul></div></div>';
+  });
+
+  container.innerHTML = html || '<p class="muted">No OUs match the current filters.</p>';
+}
+
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
+  });
+});
+
+const policySearch = document.getElementById('policy-search');
+const severityFilter = document.getElementById('severity-filter');
+policySearch.addEventListener('input', () => renderPolicies(policySearch.value, severityFilter.value));
+severityFilter.addEventListener('change', () => renderPolicies(policySearch.value, severityFilter.value));
+
+const scopeSearch = document.getElementById('scope-search');
+const onlyGapsToggle = document.getElementById('only-gaps');
+scopeSearch.addEventListener('input', () => renderScope(scopeSearch.value, onlyGapsToggle.checked));
+onlyGapsToggle.addEventListener('change', () => renderScope(scopeSearch.value, onlyGapsToggle.checked));
+
+document.body.addEventListener('mouseover', e => {
+  const el = e.target.closest('.trustee');
+  if (!el) return;
+  tooltip.innerHTML = tooltipContentForSid(el.dataset.sid, el.dataset.name);
+  tooltip.style.display = 'block';
+});
+
+document.body.addEventListener('mousemove', e => {
+  if (tooltip.style.display !== 'block') return;
+  const offsetX = 16;
+  const offsetY = 16;
+  let left = e.clientX + offsetX;
+  let top = e.clientY + offsetY;
+  const maxLeft = window.innerWidth - tooltip.offsetWidth - 10;
+  const maxTop = window.innerHeight - tooltip.offsetHeight - 10;
+  if (left > maxLeft) left = e.clientX - tooltip.offsetWidth - offsetX;
+  if (top > maxTop) top = e.clientY - tooltip.offsetHeight - offsetY;
+  tooltip.style.left = Math.max(10, left) + 'px';
+  tooltip.style.top = Math.max(10, top) + 'px';
+});
+
+document.body.addEventListener('mouseout', e => {
+  const el = e.target.closest('.trustee');
+  if (!el) return;
+  tooltip.style.display = 'none';
+});
+
+renderSummary();
+renderPolicies('', 'all');
+renderScope('', false);
+</script>
+</body>
+</html>
+'@
+
+    $DashboardHtml = $DashboardHtmlTemplate.Replace("__DASHBOARD_JSON__", $DashboardJsonSafe)
+    $DashboardHtml = $DashboardHtml.Replace("__GENERATED_AT__", $DashboardData.generatedAt)
+    $DashboardHtml = $DashboardHtml.Replace("__DOMAIN__", $DomainDnsRoot)
+    $DashboardHtml = $DashboardHtml.Replace("__DC__", $DomainController)
+
+    $DashboardHtmlPath = Join-Path $OutputPath "AUDIT-DASHBOARD.html"
+    $DashboardHtml | Set-Content -LiteralPath $DashboardHtmlPath -Encoding UTF8
+
+    Write-AuditLog "Dashboard written to: $DashboardHtmlPath"
 
     #######################################################################
     # Create human-readable audit summary
@@ -940,6 +1985,15 @@ try {
     $SummaryLines.Add(
         "GPOs refusing inbound and outbound NTLMv1 : $($NtlmFullyPrevented.Count)"
     )
+    $SummaryLines.Add(
+        "Domain/OU targets that failed inheritance evaluation: $($InheritanceErrorResults.Count) of $($ScopeTargets.Count)"
+    )
+    $SummaryLines.Add(
+        "Security-filtering groups with resolved membership: $($GroupMembershipCache.Keys.Count)"
+    )
+    $SummaryLines.Add(
+        "GPOs where GptTmpl.inf could not be read from SYSVOL: $($GptTmplAccessErrors.Count)"
+    )
     $SummaryLines.Add("")
     $SummaryLines.Add("INTERPRETATION")
     $SummaryLines.Add("--------------")
@@ -962,20 +2016,34 @@ try {
         "Final applicability can still be affected by security filtering, WMI filtering, disabled GPO sections, client-side processing and object permissions."
     )
     $SummaryLines.Add(
+        "Domain/OU targets listed in Inheritance-Evaluation-Errors.csv could not be checked at all; treat them as evidence gaps, not as confirmed absence of a policy."
+    )
+    $SummaryLines.Add(
+        "Group membership shown in the dashboard is capped at $MaxGroupMembersToDisplay members per group; see the group members CSV for the complete list."
+    )
+    $SummaryLines.Add(
+        "GPOs listed in GptTmpl-Access-Errors.csv could not be read from SYSVOL (e.g. delegated ACLs, replication lag); their configured-setting evidence is incomplete, not confirmed absent."
+    )
+    $SummaryLines.Add(
         "Use gpresult or Resultant Set of Policy for endpoint-specific implementation evidence."
     )
     $SummaryLines.Add("")
     $SummaryLines.Add("EVIDENCE FILES")
     $SummaryLines.Add("--------------")
+    $SummaryLines.Add("AUDIT-DASHBOARD.html (open in a browser)")
     $SummaryLines.Add("CSV\Configured-Security-Policies.csv")
+    $SummaryLines.Add("CSV\GptTmpl-Access-Errors.csv")
     $SummaryLines.Add("CSV\Relevant-GPO-Direct-Links.csv")
     $SummaryLines.Add("CSV\Relevant-GPO-Structural-Scope.csv")
     $SummaryLines.Add("CSV\Relevant-GPO-Permissions.csv")
+    $SummaryLines.Add("CSV\Relevant-GPO-Security-Filtering-Group-Members.csv")
     $SummaryLines.Add("CSV\Relevant-GPO-WMI-Filters.csv")
+    $SummaryLines.Add("CSV\Inheritance-Evaluation-Errors.csv")
     $SummaryLines.Add("GPO-Reports-HTML\")
     $SummaryLines.Add("GPO-Reports-XML\")
     $SummaryLines.Add("Raw-GptTmpl-INF\")
     $SummaryLines.Add("Metadata\Collection-Metadata.csv")
+    $SummaryLines.Add("Metadata\Dashboard-Data.json")
     $SummaryLines.Add("Metadata\Evidence-File-Hashes-SHA256.csv")
 
     $SummaryLines |

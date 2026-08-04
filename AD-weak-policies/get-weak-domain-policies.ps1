@@ -1,3 +1,5 @@
+# THIS SCRIPT IS INTENDED TO BE RUN FROM A DOMAIN JOINED COMPUTER WITH DOMAIN ADMIN PRIVILEGES
+
 ###########################################################################
 # 1. GET SERVER LIST VIA LDAP
 ###########################################################################

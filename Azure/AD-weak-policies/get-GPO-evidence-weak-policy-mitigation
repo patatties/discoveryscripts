@@ -1,0 +1,1048 @@
+#requires -Version 5.1
+#requires -Modules ActiveDirectory, GroupPolicy
+
+<#
+.SYNOPSIS
+    Exports audit evidence for Group Policy settings related to:
+    - SMB signing enforcement
+    - NTLMv1 prevention
+    - GPO links and structural scope
+    - Security filtering
+    - WMI filtering
+    - Group Policy inheritance
+
+.DESCRIPTION
+    This script is intended to be executed from a domain controller or a
+    management system with the ActiveDirectory and GroupPolicy modules.
+
+    The script uses language-independent registry paths and values instead
+    of localized Group Policy display names. This makes it suitable for
+    domains containing systems with different operating system languages.
+
+    Security Options configured through Group Policy are read directly from
+    GptTmpl.inf files in SYSVOL.
+
+    The script produces:
+    - CSV summaries
+    - Per-GPO HTML and XML reports
+    - Raw GptTmpl.inf evidence
+    - Direct GPO link information
+    - Structural inherited scope information
+    - Security filtering information
+    - WMI filter information
+    - SHA-256 hashes for all evidence files
+    - A PowerShell transcript
+    - A human-readable audit summary
+
+.NOTES
+    Run from an elevated Windows PowerShell session.
+
+    Structural scope does not automatically mean that a GPO applies to every
+    object below a link. Security filtering, WMI filtering, loopback processing,
+    disabled GPO sections, and client-side processing can affect final policy
+    application.
+
+    For computer-specific proof, supplement this domain-level evidence with:
+        gpresult.exe /h GPResult.html
+    or:
+        Get-GPResultantSetOfPolicy
+
+.EXAMPLE
+    .\Export-GpoSecurityEvidence.ps1
+
+.EXAMPLE
+    .\Export-GpoSecurityEvidence.ps1 -OutputPath C:\AuditEvidence\GPO
+
+.EXAMPLE
+    .\Export-GpoSecurityEvidence.ps1 `
+        -OutputPath C:\AuditEvidence\GPO `
+        -DomainController DC01.contoso.com
+#>
+
+[CmdletBinding()]
+param (
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$OutputPath = (
+        Join-Path -Path $PWD -ChildPath (
+            "GPO-Security-Evidence-{0}" -f (Get-Date -Format "yyyyMMdd-HHmmss")
+        )
+    ),
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$DomainController
+)
+
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = "Stop"
+
+###########################################################################
+# Helper functions
+###########################################################################
+
+function Write-AuditLog {
+    param (
+        [Parameter(Mandatory)]
+        [string]$Message,
+
+        [Parameter()]
+        [ValidateSet("INFO", "WARNING", "ERROR")]
+        [string]$Level = "INFO"
+    )
+
+    $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    Write-Host "[$Timestamp] [$Level] $Message"
+}
+
+function New-SafeFileName {
+    param (
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$Name
+    )
+
+    $InvalidCharacters = [System.IO.Path]::GetInvalidFileNameChars()
+    $SafeName = $Name
+
+    foreach ($Character in $InvalidCharacters) {
+        $SafeName = $SafeName.Replace([string]$Character, "_")
+    }
+
+    if (:IsNullOrWhiteSpace($SafeName)) {
+        return "Unnamed"
+    }
+
+    return $SafeName
+}
+
+function ConvertTo-StringValue {
+    param (
+        [Parameter()]
+        $Value
+    )
+
+    if ($null -eq $Value) {
+        return ""
+    }
+
+    return [string]$Value
+}
+
+function Get-InfRegistryValue {
+    param (
+        [Parameter(Mandatory)]
+        [string[]]$Content,
+
+        [Parameter(Mandatory)]
+        [string]$RegistryPath,
+
+        [Parameter(Mandatory)]
+        [string]$ValueName
+    )
+
+    $Target = "{0}\{1}" -f $RegistryPath.TrimEnd("\"), $ValueName
+    $InRegistrySection = $false
+
+    foreach ($Line in $Content) {
+        $TrimmedLine = $Line.Trim()
+
+        if ($TrimmedLine -match '^\[(.+)\]$') {
+            $SectionName = $Matches[1]
+            $InRegistrySection = (
+                $SectionName -ieq "Registry Values"
+            )
+
+            continue
+        }
+
+        if (-not $InRegistrySection) {
+            continue
+        }
+
+        if (
+            :IsNullOrWhiteSpace($TrimmedLine) -or
+            $TrimmedLine.StartsWith(";")
+        ) {
+            continue
+        }
+
+        $SeparatorIndex = $TrimmedLine.IndexOf("=")
+
+        if ($SeparatorIndex -lt 1) {
+            continue
+        }
+
+        $ConfiguredName = $TrimmedLine.Substring(
+            0,
+            $SeparatorIndex
+        ).Trim()
+
+        if ($ConfiguredName -ine $Target) {
+            continue
+        }
+
+        $RawData = $TrimmedLine.Substring(
+            $SeparatorIndex + 1
+        ).Trim()
+
+        $DataParts = $RawData -split ",", 2
+        $RegistryType = $DataParts[0]
+        $RegistryData = ""
+
+        if ($DataParts.Count -gt 1) {
+            $RegistryData = $DataParts[1].Trim().Trim('"')
+        }
+
+        return [PSCustomObject]@{
+            Found        = $true
+            RegistryPath = $RegistryPath
+            ValueName    = $ValueName
+            RegistryType = $RegistryType
+            RegistryData = $RegistryData
+            RawEntry     = $TrimmedLine
+        }
+    }
+
+    return [PSCustomObject]@{
+        Found        = $false
+        RegistryPath = $RegistryPath
+        ValueName    = $ValueName
+        RegistryType = ""
+        RegistryData = ""
+        RawEntry     = ""
+    }
+}
+
+function Get-NtlmInterpretation {
+    param (
+        [Parameter()]
+        [AllowNull()]
+        $Value
+    )
+
+    if ($null -eq $Value -or :IsNullOrWhiteSpace([string]$Value)) {
+        return [PSCustomObject]@{
+            Status         = "Not configured"
+            ClientBehavior = "Not determined from this GPO"
+            ServerBehavior = "Not determined from this GPO"
+            AuditConclusion = "This GPO does not explicitly configure LmCompatibilityLevel"
+        }
+    }
+
+    $IntegerValue = 0
+
+    if (-not :TryParse([string]$Value, [ref]$IntegerValue)) {
+        return [PSCustomObject]@{
+            Status          = "Unknown"
+            ClientBehavior  = "Unrecognized value"
+            ServerBehavior  = "Unrecognized value"
+            AuditConclusion = "Manual review required"
+        }
+    }
+
+    switch ($IntegerValue) {
+        0 {
+            return [PSCustomObject]@{
+                Status          = "Insecure"
+                ClientBehavior  = "Sends LM and NTLM responses"
+                ServerBehavior  = "Accepts LM, NTLM and NTLMv2"
+                AuditConclusion = "NTLMv1 is allowed"
+            }
+        }
+
+        1 {
+            return [PSCustomObject]@{
+                Status          = "Insecure"
+                ClientBehavior  = "Sends LM and NTLM; uses NTLMv2 session security when negotiated"
+                ServerBehavior  = "Accepts LM, NTLM and NTLMv2"
+                AuditConclusion = "NTLMv1 is allowed"
+            }
+        }
+
+        2 {
+            return [PSCustomObject]@{
+                Status          = "Insecure"
+                ClientBehavior  = "Sends NTLM responses"
+                ServerBehavior  = "Accepts LM, NTLM and NTLMv2"
+                AuditConclusion = "NTLMv1 is allowed"
+            }
+        }
+
+        3 {
+            return [PSCustomObject]@{
+                Status          = "Partial protection"
+                ClientBehavior  = "Sends NTLMv2 responses only"
+                ServerBehavior  = "Accepts LM, NTLM and NTLMv2"
+                AuditConclusion = "Outbound NTLMv1 is prevented, but inbound NTLMv1 may still be accepted"
+            }
+        }
+
+        4 {
+            return [PSCustomObject]@{
+                Status          = "Partial protection"
+                ClientBehavior  = "Sends NTLMv2 responses only"
+                ServerBehavior  = "Refuses LM but accepts NTLM and NTLMv2"
+                AuditConclusion = "Outbound NTLMv1 is prevented, but inbound NTLMv1 may still be accepted"
+            }
+        }
+
+        5 {
+            return [PSCustomObject]@{
+                Status          = "Enforced"
+                ClientBehavior  = "Sends NTLMv2 responses only"
+                ServerBehavior  = "Refuses LM and NTLM; accepts NTLMv2"
+                AuditConclusion = "LM and NTLMv1 are prevented for both outbound and inbound authentication"
+            }
+        }
+
+        default {
+            return [PSCustomObject]@{
+                Status          = "Unknown"
+                ClientBehavior  = "Unknown"
+                ServerBehavior  = "Unknown"
+                AuditConclusion = "LmCompatibilityLevel is outside the expected range of 0 through 5"
+            }
+        }
+    }
+}
+
+function Get-XmlText {
+    param (
+        [Parameter()]
+        $Node,
+
+        [Parameter(Mandatory)]
+        [string]$ChildLocalName
+    )
+
+    if ($null -eq $Node) {
+        return ""
+    }
+
+    $Child = $Node.SelectSingleNode(
+        "./*[local-name()='$ChildLocalName']"
+    )
+
+    if ($null -eq $Child) {
+        return ""
+    }
+
+    return $Child.InnerText
+}
+
+###########################################################################
+# Validate required modules
+###########################################################################
+
+foreach ($RequiredModule in @("ActiveDirectory", "GroupPolicy")) {
+    if (-not (Get-Module -ListAvailable -Name $RequiredModule)) {
+        throw "Required module '$RequiredModule' is not installed."
+    }
+
+    Import-Module $RequiredModule -ErrorAction Stop
+}
+
+###########################################################################
+# Prepare evidence directories
+###########################################################################
+
+$Directories = @{
+    Root       = $OutputPath
+    GpoHtml    = Join-Path $OutputPath "GPO-Reports-HTML"
+    GpoXml     = Join-Path $OutputPath "GPO-Reports-XML"
+    RawPolicy  = Join-Path $OutputPath "Raw-GptTmpl-INF"
+    Csv        = Join-Path $OutputPath "CSV"
+    Metadata   = Join-Path $OutputPath "Metadata"
+}
+
+foreach ($Directory in $Directories.Values) {
+    if (-not (Test-Path -LiteralPath $Directory)) {
+        $null = New-Item `
+            -Path $Directory `
+            -ItemType Directory `
+            -Force
+    }
+}
+
+$TranscriptPath = Join-Path $Directories.Metadata "PowerShell-Transcript.txt"
+Start-Transcript -Path $TranscriptPath -Force | Out-Null
+
+try {
+    Write-AuditLog "Starting Group Policy security evidence collection."
+
+    #######################################################################
+    # Determine domain and domain controller
+    #######################################################################
+
+    if ($DomainController) {
+        $Domain = Get-ADDomain -Server $DomainController
+    }
+    else {
+        $Domain = Get-ADDomain
+        $DomainController = (
+            Get-ADDomainController -Discover -Writable
+        ).HostName
+    }
+
+    $DomainDnsRoot = $Domain.DNSRoot
+    $DomainDistinguishedName = $Domain.DistinguishedName
+
+    Write-AuditLog "Domain: $DomainDnsRoot"
+    Write-AuditLog "Domain controller: $DomainController"
+
+    #######################################################################
+    # Record collection metadata
+    #######################################################################
+
+    $CollectorOperatingSystem = Get-CimInstance `
+        -ClassName Win32_OperatingSystem
+
+    $Metadata = [PSCustomObject]@{
+        CollectionStart       = Get-Date
+        CollectorComputer     = $env:COMPUTERNAME
+        CollectorUser         = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+        CollectorOS           = $CollectorOperatingSystem.Caption
+        CollectorOSVersion    = $CollectorOperatingSystem.Version
+        PowerShellVersion     = $PSVersionTable.PSVersion.ToString()
+        Domain                = $DomainDnsRoot
+        DomainDistinguishedName = $DomainDistinguishedName
+        DomainController      = $DomainController
+        Forest                = $Domain.Forest
+        DomainMode            = $Domain.DomainMode
+        PDCEmulator           = $Domain.PDCEmulator
+    }
+
+    $Metadata |
+        Export-Csv `
+            -Path (Join-Path $Directories.Metadata "Collection-Metadata.csv") `
+            -NoTypeInformation `
+            -Encoding UTF8
+
+    #######################################################################
+    # Registry targets
+    #######################################################################
+
+    $PolicyTargets = @(
+        [PSCustomObject]@{
+            Category     = "SMB signing"
+            Setting      = "SMB server signing required"
+            RegistryPath = "MACHINE\System\CurrentControlSet\Services\LanManServer\Parameters"
+            ValueName    = "RequireSecuritySignature"
+        },
+        [PSCustomObject]@{
+            Category     = "SMB signing"
+            Setting      = "SMB client signing required"
+            RegistryPath = "MACHINE\System\CurrentControlSet\Services\LanManWorkstation\Parameters"
+            ValueName    = "RequireSecuritySignature"
+        },
+        [PSCustomObject]@{
+            Category     = "NTLMv1"
+            Setting      = "LAN Manager authentication level"
+            RegistryPath = "MACHINE\System\CurrentControlSet\Control\Lsa"
+            ValueName    = "LmCompatibilityLevel"
+        }
+    )
+
+    #######################################################################
+    # Retrieve all GPOs
+    #######################################################################
+
+    $Gpos = @(
+        Get-GPO `
+            -All `
+            -Domain $DomainDnsRoot `
+            -Server $DomainController |
+        Sort-Object DisplayName
+    )
+
+    Write-AuditLog "Found $($Gpos.Count) Group Policy Objects."
+
+    $PolicyResults = New-Object System.Collections.Generic.List[object]
+    $RelevantGpoIds = New-Object System.Collections.Generic.HashSet[string]
+
+    #######################################################################
+    # Inspect every GPO
+    #######################################################################
+
+    foreach ($Gpo in $Gpos) {
+        $GpoGuid = $Gpo.Id.ToString()
+        $SafeGpoName = New-SafeFileName -Name $Gpo.DisplayName
+        $ReportBaseName = "{0}--{1}" -f $SafeGpoName, $GpoGuid
+
+        Write-AuditLog "Inspecting GPO: $($Gpo.DisplayName)"
+
+        $XmlReportPath = Join-Path `
+            $Directories.GpoXml `
+            ($ReportBaseName + ".xml")
+
+        $HtmlReportPath = Join-Path `
+            $Directories.GpoHtml `
+            ($ReportBaseName + ".html")
+
+        Get-GPOReport `
+            -Guid $Gpo.Id `
+            -Domain $DomainDnsRoot `
+            -Server $DomainController `
+            -ReportType Xml `
+            -Path $XmlReportPath
+
+        Get-GPOReport `
+            -Guid $Gpo.Id `
+            -Domain $DomainDnsRoot `
+            -Server $DomainController `
+            -ReportType Html `
+            -Path $HtmlReportPath
+
+        $GptTmplUncPath = (
+            "\\{0}\SYSVOL\{1}\Policies\{{{2}}}\Machine\Microsoft\Windows NT\SecEdit\GptTmpl.inf" -f
+            $DomainDnsRoot,
+            $DomainDnsRoot,
+            $GpoGuid
+        )
+
+        $InfContent = @()
+        $InfAvailable = $false
+        $RawInfPath = ""
+
+        if (Test-Path -LiteralPath $GptTmplUncPath) {
+            $InfContent = @(
+                Get-Content `
+                    -LiteralPath $GptTmplUncPath `
+                    -Encoding Unicode
+            )
+
+            $InfAvailable = $true
+            $RawInfPath = Join-Path `
+                $Directories.RawPolicy `
+                ($ReportBaseName + "--GptTmpl.inf")
+
+            Copy-Item `
+                -LiteralPath $GptTmplUncPath `
+                -Destination $RawInfPath `
+                -Force
+        }
+
+        foreach ($Target in $PolicyTargets) {
+            if ($InfAvailable) {
+                $ConfiguredValue = Get-InfRegistryValue `
+                    -Content $InfContent `
+                    -RegistryPath $Target.RegistryPath `
+                    -ValueName $Target.ValueName
+            }
+            else {
+                $ConfiguredValue = [PSCustomObject]@{
+                    Found        = $false
+                    RegistryPath = $Target.RegistryPath
+                    ValueName    = $Target.ValueName
+                    RegistryType = ""
+                    RegistryData = ""
+                    RawEntry     = ""
+                }
+            }
+
+            if (-not $ConfiguredValue.Found) {
+                continue
+            }
+
+            $null = $RelevantGpoIds.Add($GpoGuid)
+
+            $Enforced = $false
+            $Interpretation = ""
+            $ClientBehavior = ""
+            $ServerBehavior = ""
+
+            if ($Target.Category -eq "SMB signing") {
+                $Enforced = (
+                    [string]$ConfiguredValue.RegistryData -eq "1"
+                )
+
+                if ($Enforced) {
+                    $Interpretation = "SMB signing is required"
+                }
+                else {
+                    $Interpretation = "SMB signing is not required by this setting"
+                }
+            }
+            elseif ($Target.Category -eq "NTLMv1") {
+                $NtlmResult = Get-NtlmInterpretation `
+                    -Value $ConfiguredValue.RegistryData
+
+                $Interpretation = $NtlmResult.AuditConclusion
+                $ClientBehavior = $NtlmResult.ClientBehavior
+                $ServerBehavior = $NtlmResult.ServerBehavior
+                $Enforced = (
+                    [string]$ConfiguredValue.RegistryData -eq "5"
+                )
+            }
+
+            $PolicyResults.Add(
+                [PSCustomObject]@{
+                    GpoName          = $Gpo.DisplayName
+                    GpoId            = $GpoGuid
+                    GpoStatus        = $Gpo.GpoStatus
+                    CreationTime     = $Gpo.CreationTime
+                    ModificationTime = $Gpo.ModificationTime
+                    Category         = $Target.Category
+                    Setting          = $Target.Setting
+                    RegistryPath     = $Target.RegistryPath
+                    ValueName        = $Target.ValueName
+                    RegistryType     = $ConfiguredValue.RegistryType
+                    RegistryData     = $ConfiguredValue.RegistryData
+                    Enforced         = $Enforced
+                    Interpretation   = $Interpretation
+                    ClientBehavior   = $ClientBehavior
+                    ServerBehavior   = $ServerBehavior
+                    RawEntry         = $ConfiguredValue.RawEntry
+                    SourceFile       = $GptTmplUncPath
+                    HtmlReport       = $HtmlReportPath
+                    XmlReport        = $XmlReportPath
+                }
+            )
+        }
+    }
+
+    #######################################################################
+    # Export configured security settings
+    #######################################################################
+
+    $PolicyResultsPath = Join-Path `
+        $Directories.Csv `
+        "Configured-Security-Policies.csv"
+
+    $PolicyResults |
+        Sort-Object Category, GpoName, Setting |
+        Export-Csv `
+            -Path $PolicyResultsPath `
+            -NoTypeInformation `
+            -Encoding UTF8
+
+    #######################################################################
+    # Collect direct links from GPO XML reports
+    #
+    # This method uses XML element names and distinguished names rather
+    # than localized Group Policy display text.
+    #######################################################################
+
+    $DirectLinkResults = New-Object System.Collections.Generic.List[object]
+
+    foreach ($Gpo in $Gpos) {
+        $GpoGuid = $Gpo.Id.ToString()
+
+        if (-not $RelevantGpoIds.Contains($GpoGuid)) {
+            continue
+        }
+
+        $SafeGpoName = New-SafeFileName -Name $Gpo.DisplayName
+        $ReportBaseName = "{0}--{1}" -f $SafeGpoName, $GpoGuid
+        $XmlReportPath = Join-Path `
+            $Directories.GpoXml `
+            ($ReportBaseName + ".xml")
+
+        [xml]$GpoReportXml = Get-Content `
+            -LiteralPath $XmlReportPath `
+            -Raw
+
+        $LinkNodes = @(
+            $GpoReportXml.SelectNodes(
+                "//*[local-name()='LinksTo']/*[local-name()='SOM']"
+            )
+        )
+
+        if ($LinkNodes.Count -eq 0) {
+            $DirectLinkResults.Add(
+                [PSCustomObject]@{
+                    GpoName      = $Gpo.DisplayName
+                    GpoId        = $GpoGuid
+                    LinkTarget   = ""
+                    Enabled      = ""
+                    Enforced     = ""
+                    LinkStatus   = "No direct links found"
+                }
+            )
+
+            continue
+        }
+
+        foreach ($LinkNode in $LinkNodes) {
+            $LinkTarget = Get-XmlText `
+                -Node $LinkNode `
+                -ChildLocalName "Path"
+
+            $LinkEnabled = Get-XmlText `
+                -Node $LinkNode `
+                -ChildLocalName "Enabled"
+
+            $LinkEnforced = Get-XmlText `
+                -Node $LinkNode `
+                -ChildLocalName "NoOverride"
+
+            $DirectLinkResults.Add(
+                [PSCustomObject]@{
+                    GpoName      = $Gpo.DisplayName
+                    GpoId        = $GpoGuid
+                    LinkTarget   = $LinkTarget
+                    Enabled      = $LinkEnabled
+                    Enforced     = $LinkEnforced
+                    LinkStatus   = "Direct link"
+                }
+            )
+        }
+    }
+
+    $DirectLinkResults |
+        Sort-Object GpoName, LinkTarget |
+        Export-Csv `
+            -Path (Join-Path $Directories.Csv "Relevant-GPO-Direct-Links.csv") `
+            -NoTypeInformation `
+            -Encoding UTF8
+
+    #######################################################################
+    # Collect structural effective scope
+    #
+    # InheritedGpoLinks represents the GPOs structurally applicable to a
+    # domain or OU after link enablement, enforcement and inheritance
+    # blocking have been evaluated.
+    #
+    # Security filtering and WMI filtering must still be evaluated
+    # separately.
+    #######################################################################
+
+    $ScopeTargets = New-Object System.Collections.Generic.List[string]
+    $ScopeTargets.Add($DomainDistinguishedName)
+
+    $OrganizationalUnits = @(
+        Get-ADOrganizationalUnit `
+            -Filter * `
+            -Server $DomainController `
+            -Properties DistinguishedName |
+        Sort-Object DistinguishedName
+    )
+
+    foreach ($OrganizationalUnit in $OrganizationalUnits) {
+        $ScopeTargets.Add($OrganizationalUnit.DistinguishedName)
+    }
+
+    Write-AuditLog (
+        "Evaluating Group Policy inheritance for {0} domain/OU targets." -f
+        $ScopeTargets.Count
+    )
+
+    $StructuralScopeResults = New-Object System.Collections.Generic.List[object]
+
+    foreach ($ScopeTarget in $ScopeTargets) {
+        try {
+            $Inheritance = Get-GPInheritance `
+                -Target $ScopeTarget `
+                -Domain $DomainDnsRoot `
+                -Server $DomainController
+
+            $InheritedLinks = @($Inheritance.InheritedGpoLinks)
+
+            foreach ($InheritedLink in $InheritedLinks) {
+                $InheritedGpoGuid = $InheritedLink.GpoId.ToString()
+
+                if (-not $RelevantGpoIds.Contains($InheritedGpoGuid)) {
+                    continue
+                }
+
+                $StructuralScopeResults.Add(
+                    [PSCustomObject]@{
+                        ScopeTarget          = $ScopeTarget
+                        ContainerName        = $Inheritance.ContainerName
+                        ContainerType        = $Inheritance.ContainerType
+                        InheritanceBlocked   = $Inheritance.GpoInheritanceBlocked
+                        GpoName              = $InheritedLink.DisplayName
+                        GpoId                = $InheritedGpoGuid
+                        LinkOrder            = $InheritedLink.Order
+                        LinkEnabled          = $InheritedLink.Enabled
+                        LinkEnforced         = $InheritedLink.Enforced
+                        StructuralResult     = "Included in InheritedGpoLinks"
+                        SecurityFilterNote   = "Security and WMI filtering not evaluated in this row"
+                    }
+                )
+            }
+        }
+        catch {
+            Write-AuditLog `
+                -Level "WARNING" `
+                -Message (
+                    "Could not evaluate inheritance for '{0}': {1}" -f
+                    $ScopeTarget,
+                    $_.Exception.Message
+                )
+        }
+    }
+
+    $StructuralScopeResults |
+        Sort-Object GpoName, ScopeTarget |
+        Export-Csv `
+            -Path (Join-Path $Directories.Csv "Relevant-GPO-Structural-Scope.csv") `
+            -NoTypeInformation `
+            -Encoding UTF8
+
+    #######################################################################
+    # Collect GPO permissions and security filtering evidence
+    #######################################################################
+
+    $PermissionResults = New-Object System.Collections.Generic.List[object]
+
+    foreach ($Gpo in $Gpos) {
+        $GpoGuid = $Gpo.Id.ToString()
+
+        if (-not $RelevantGpoIds.Contains($GpoGuid)) {
+            continue
+        }
+
+        $Permissions = @(
+            Get-GPPermission `
+                -Guid $Gpo.Id `
+                -All `
+                -Domain $DomainDnsRoot `
+                -Server $DomainController
+        )
+
+        foreach ($Permission in $Permissions) {
+            $PermissionResults.Add(
+                [PSCustomObject]@{
+                    GpoName             = $Gpo.DisplayName
+                    GpoId               = $GpoGuid
+                    TrusteeName         = $Permission.Trustee.Name
+                    TrusteeDomain       = $Permission.Trustee.Domain
+                    TrusteeSid          = $Permission.Trustee.Sid.Value
+                    TrusteeType         = $Permission.Trustee.SidType
+                    Permission          = $Permission.Permission
+                    Inherited           = $Permission.Inherited
+                    AppliesToGpo        = (
+                        $Permission.Permission -eq "GpoApply"
+                    )
+                }
+            )
+        }
+    }
+
+    $PermissionResults |
+        Sort-Object GpoName, Permission, TrusteeName |
+        Export-Csv `
+            -Path (Join-Path $Directories.Csv "Relevant-GPO-Permissions.csv") `
+            -NoTypeInformation `
+            -Encoding UTF8
+
+    #######################################################################
+    # Collect WMI filter evidence
+    #######################################################################
+
+    $WmiFilterResults = New-Object System.Collections.Generic.List[object]
+
+    foreach ($Gpo in $Gpos) {
+        $GpoGuid = $Gpo.Id.ToString()
+
+        if (-not $RelevantGpoIds.Contains($GpoGuid)) {
+            continue
+        }
+
+        $WmiFilterName = ""
+        $WmiFilterPath = ""
+
+        try {
+            if ($null -ne $Gpo.WmiFilter) {
+                $WmiFilterName = ConvertTo-StringValue `
+                    -Value $Gpo.WmiFilter.Name
+
+                $WmiFilterPath = ConvertTo-StringValue `
+                    -Value $Gpo.WmiFilter.Path
+            }
+        }
+        catch {
+            $WmiFilterName = "See XML/HTML GPO report"
+            $WmiFilterPath = ""
+        }
+
+        $WmiFilterResults.Add(
+            [PSCustomObject]@{
+                GpoName       = $Gpo.DisplayName
+                GpoId         = $GpoGuid
+                WmiFilterName = $WmiFilterName
+                WmiFilterPath = $WmiFilterPath
+                ReviewReport  = (
+                    "Review the corresponding XML or HTML report for complete WMI filter evidence"
+                )
+            }
+        )
+    }
+
+    $WmiFilterResults |
+        Sort-Object GpoName |
+        Export-Csv `
+            -Path (Join-Path $Directories.Csv "Relevant-GPO-WMI-Filters.csv") `
+            -NoTypeInformation `
+            -Encoding UTF8
+
+    #######################################################################
+    # Create human-readable audit summary
+    #######################################################################
+
+    $SummaryPath = Join-Path $OutputPath "AUDIT-SUMMARY.txt"
+
+    $SmbServerRequired = @(
+        $PolicyResults |
+        Where-Object {
+            $_.Setting -eq "SMB server signing required" -and
+            $_.RegistryData -eq "1"
+        }
+    )
+
+    $SmbClientRequired = @(
+        $PolicyResults |
+        Where-Object {
+            $_.Setting -eq "SMB client signing required" -and
+            $_.RegistryData -eq "1"
+        }
+    )
+
+    $NtlmClientOnly = @(
+        $PolicyResults |
+        Where-Object {
+            $_.Setting -eq "LAN Manager authentication level" -and
+            $_.RegistryData -in @("3", "4")
+        }
+    )
+
+    $NtlmFullyPrevented = @(
+        $PolicyResults |
+        Where-Object {
+            $_.Setting -eq "LAN Manager authentication level" -and
+            $_.RegistryData -eq "5"
+        }
+    )
+
+    $SummaryLines = New-Object System.Collections.Generic.List[string]
+
+    $SummaryLines.Add("GROUP POLICY SECURITY AUDIT EVIDENCE")
+    $SummaryLines.Add("====================================")
+    $SummaryLines.Add("")
+    $SummaryLines.Add("Collection time : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss K')")
+    $SummaryLines.Add("Domain          : $DomainDnsRoot")
+    $SummaryLines.Add("Domain controller: $DomainController")
+    $SummaryLines.Add("Collector       : $env:COMPUTERNAME")
+    $SummaryLines.Add("")
+    $SummaryLines.Add("RESULT COUNTS")
+    $SummaryLines.Add("-------------")
+    $SummaryLines.Add(
+        "GPOs requiring inbound/server SMB signing : $($SmbServerRequired.Count)"
+    )
+    $SummaryLines.Add(
+        "GPOs requiring outbound/client SMB signing: $($SmbClientRequired.Count)"
+    )
+    $SummaryLines.Add(
+        "GPOs preventing outbound NTLMv1 only      : $($NtlmClientOnly.Count)"
+    )
+    $SummaryLines.Add(
+        "GPOs refusing inbound and outbound NTLMv1 : $($NtlmFullyPrevented.Count)"
+    )
+    $SummaryLines.Add("")
+    $SummaryLines.Add("INTERPRETATION")
+    $SummaryLines.Add("--------------")
+    $SummaryLines.Add(
+        "SMB signing is enforced when RequireSecuritySignature is configured as 1."
+    )
+    $SummaryLines.Add(
+        "LmCompatibilityLevel 3 or 4 prevents clients from sending NTLMv1, but does not fully prevent the system from accepting NTLMv1."
+    )
+    $SummaryLines.Add(
+        "LmCompatibilityLevel 5 sends NTLMv2 only and refuses inbound LM and NTLMv1."
+    )
+    $SummaryLines.Add("")
+    $SummaryLines.Add("IMPORTANT SCOPE LIMITATION")
+    $SummaryLines.Add("--------------------------")
+    $SummaryLines.Add(
+        "The structural scope export shows domain and OU containers where a GPO appears in InheritedGpoLinks."
+    )
+    $SummaryLines.Add(
+        "Final applicability can still be affected by security filtering, WMI filtering, disabled GPO sections, client-side processing and object permissions."
+    )
+    $SummaryLines.Add(
+        "Use gpresult or Resultant Set of Policy for endpoint-specific implementation evidence."
+    )
+    $SummaryLines.Add("")
+    $SummaryLines.Add("EVIDENCE FILES")
+    $SummaryLines.Add("--------------")
+    $SummaryLines.Add("CSV\Configured-Security-Policies.csv")
+    $SummaryLines.Add("CSV\Relevant-GPO-Direct-Links.csv")
+    $SummaryLines.Add("CSV\Relevant-GPO-Structural-Scope.csv")
+    $SummaryLines.Add("CSV\Relevant-GPO-Permissions.csv")
+    $SummaryLines.Add("CSV\Relevant-GPO-WMI-Filters.csv")
+    $SummaryLines.Add("GPO-Reports-HTML\")
+    $SummaryLines.Add("GPO-Reports-XML\")
+    $SummaryLines.Add("Raw-GptTmpl-INF\")
+    $SummaryLines.Add("Metadata\Collection-Metadata.csv")
+    $SummaryLines.Add("Metadata\Evidence-File-Hashes-SHA256.csv")
+
+    $SummaryLines |
+        Set-Content `
+            -LiteralPath $SummaryPath `
+            -Encoding UTF8
+
+    #######################################################################
+    # Generate SHA-256 hashes
+    #
+    # The hash manifest can be used to demonstrate that the exported
+    # evidence files have not changed after collection.
+    #######################################################################
+
+    $HashManifestPath = Join-Path `
+        $Directories.Metadata `
+        "Evidence-File-Hashes-SHA256.csv"
+
+    $EvidenceFiles = @(
+        Get-ChildItem `
+            -LiteralPath $OutputPath `
+            -File `
+            -Recurse |
+        Where-Object {
+            $_.FullName -ne $HashManifestPath -and
+            $_.FullName -ne $TranscriptPath
+        }
+    )
+
+    $HashResults = foreach ($EvidenceFile in $EvidenceFiles) {
+        $Hash = Get-FileHash `
+            -LiteralPath $EvidenceFile.FullName `
+            -Algorithm SHA256
+
+        [PSCustomObject]@{
+            RelativePath = $EvidenceFile.FullName.Substring(
+                $OutputPath.Length
+            ).TrimStart("\")
+            LengthBytes  = $EvidenceFile.Length
+            LastWriteTime = $EvidenceFile.LastWriteTime
+            Algorithm    = $Hash.Algorithm
+            SHA256       = $Hash.Hash
+        }
+    }
+
+    $HashResults |
+        Sort-Object RelativePath |
+        Export-Csv `
+            -Path $HashManifestPath `
+            -NoTypeInformation `
+            -Encoding UTF8
+
+    Write-AuditLog "Evidence collection completed successfully."
+    Write-AuditLog "Evidence directory: $OutputPath"
+}
+catch {
+    Write-AuditLog `
+        -Level "ERROR" `
+        -Message $_.Exception.Message
+
+    throw
+}
+finally {
+    try {
+        Stop-Transcript | Out-Null
+    }
+    catch {
+        # A transcript may not have started if initialization failed.
+    }
+}

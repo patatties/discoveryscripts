@@ -22,6 +22,15 @@
       nested inside privileged groups (with the nesting path recorded)
     - The default domain password policy and any fine-grained password
       policies (PSOs)
+    - A set of user- and computer-account security checks (shown on the
+      dashboard "Users" and "Computers" tabs, one CSV per check), each with
+      a severity and a recommendation. Covered: Kerberoastable and AS-REP
+      roastable accounts, password-never-expires, old passwords, privileged
+      accounts, AdminCount, SIDHistory, unconstrained / constrained /
+      resource-based constrained delegation, accounts without AES, DES
+      allowed, inactive and disabled accounts, service accounts, domain
+      controllers, LAPS coverage, Protected Users, and sensitive /
+      cannot-be-delegated accounts
 
     Also produces a single-file interactive HTML dashboard that lets you
     trace, per GPO and per OU/domain, whether a weak setting is mitigated,
@@ -55,6 +64,8 @@
     - A cumulative privileged-account x administrative groups matrix,
       including Protected Users membership status
     - Default and fine-grained password policy evidence
+    - Per-user and per-computer security checks (one CSV per check), each
+      with a severity (Critical/High/Medium/Low/Info) and a recommendation
     - A record of OUs/domain containers where inheritance could not be
       evaluated, even after retries
     - An interactive HTML dashboard (AUDIT-DASHBOARD.html) combining all
@@ -173,7 +184,19 @@ param (
 
     [Parameter()]
     [ValidateRange(1, 25)]
-    [int]$MaxGroupNestingDepth = 10
+    [int]$MaxGroupNestingDepth = 10,
+
+    [Parameter()]
+    [ValidateRange(1, 3650)]
+    [int]$OldPasswordThresholdDays = 180,
+
+    [Parameter()]
+    [ValidateRange(1, 3650)]
+    [int]$InactiveAccountThresholdDays = 90,
+
+    [Parameter()]
+    [ValidateRange(1, 100000)]
+    [int]$MaxAccountRowsToDisplay = 200
 )
 
 Set-StrictMode -Version 2.0
@@ -740,6 +763,249 @@ function Get-RecursiveGroupMembership {
     return $Result
 }
 
+function Get-AdProp {
+    <#
+        Safely reads a single property from an AD object under
+        Set-StrictMode. Requested-but-unset properties can be either $null
+        or absent depending on the attribute; this returns $null in both
+        cases instead of throwing a PropertyNotFoundStrict error.
+    #>
+    param (
+        [Parameter(Mandatory)]
+        $Object,
+
+        [Parameter(Mandatory)]
+        [string]$Name
+    )
+
+    $Property = $Object.PSObject.Properties[$Name]
+
+    if ($null -eq $Property) {
+        return $null
+    }
+
+    return $Property.Value
+}
+
+function Get-AdMultiValue {
+    <#
+        Reads a multi-valued AD property as an array, returning an empty
+        array when the attribute is unset.
+    #>
+    param (
+        [Parameter(Mandatory)]
+        $Object,
+
+        [Parameter(Mandatory)]
+        [string]$Name
+    )
+
+    $Value = Get-AdProp -Object $Object -Name $Name
+
+    if ($null -eq $Value) {
+        return @()
+    }
+
+    return @($Value)
+}
+
+function Get-YesNo {
+    param (
+        [Parameter()]
+        [bool]$Value
+    )
+
+    if ($Value) {
+        return "Yes"
+    }
+
+    return "No"
+}
+
+function Format-DateValue {
+    param (
+        [Parameter()]
+        [AllowNull()]
+        $Value
+    )
+
+    if ($null -eq $Value) {
+        return ""
+    }
+
+    try {
+        return (Get-Date $Value -Format "yyyy-MM-dd HH:mm")
+    }
+    catch {
+        return [string]$Value
+    }
+}
+
+function Get-KerberosEncryptionInfo {
+    <#
+        Interprets msDS-SupportedEncryptionTypes (a bitmask) plus the
+        UseDESKeyOnly flag into human-readable Kerberos encryption support.
+
+        Bits: 0x1 DES-CBC-CRC, 0x2 DES-CBC-MD5, 0x4 RC4-HMAC,
+              0x8 AES128, 0x10 AES256.
+    #>
+    param (
+        [Parameter()]
+        [AllowNull()]
+        $EncryptionTypes,
+
+        [Parameter()]
+        [bool]$UseDesKeyOnly = $false
+    )
+
+    $Configured = ($null -ne $EncryptionTypes)
+    $Value = 0
+
+    if ($Configured) {
+        try { $Value = [int]$EncryptionTypes } catch { $Value = 0 }
+    }
+
+    $Names = New-Object System.Collections.Generic.List[string]
+    if ($Value -band 0x1)  { $Names.Add("DES-CBC-CRC") }
+    if ($Value -band 0x2)  { $Names.Add("DES-CBC-MD5") }
+    if ($Value -band 0x4)  { $Names.Add("RC4-HMAC") }
+    if ($Value -band 0x8)  { $Names.Add("AES128") }
+    if ($Value -band 0x10) { $Names.Add("AES256") }
+    if ($UseDesKeyOnly)    { $Names.Add("UseDESKeyOnly") }
+
+    $Des = (($Value -band 0x1) -ne 0) -or (($Value -band 0x2) -ne 0) -or $UseDesKeyOnly
+    $Rc4 = (($Value -band 0x4) -ne 0)
+    $Aes = (($Value -band 0x8) -ne 0) -or (($Value -band 0x10) -ne 0)
+
+    $Label = "Not configured"
+    if ($Configured) {
+        if ($Names.Count -gt 0) {
+            $Label = ($Names -join ", ")
+        }
+        else {
+            $Label = "None (0)"
+        }
+    }
+    elseif ($UseDesKeyOnly) {
+        $Label = "UseDESKeyOnly (SupportedEncryptionTypes not configured)"
+    }
+
+    return [PSCustomObject]@{
+        Configured = $Configured
+        Value      = $Value
+        Des        = $Des
+        Rc4        = $Rc4
+        Aes        = $Aes
+        Label      = $Label
+    }
+}
+
+function Test-LegacyOperatingSystem {
+    param (
+        [Parameter()]
+        [AllowEmptyString()]
+        [AllowNull()]
+        [string]$OperatingSystem
+    )
+
+    if ([string]::IsNullOrWhiteSpace($OperatingSystem)) {
+        return $false
+    }
+
+    foreach ($Legacy in @("2000", "2003", "2008", "2012", "Windows XP", "Windows Vista", "Windows 7", "Windows 8")) {
+        if ($OperatingSystem -like "*$Legacy*") {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function New-AccountCheck {
+    <#
+        Builds one security-check result: exports the full row set to CSV
+        (a header-only file when empty) and returns a dashboard object with
+        a display-capped row set, severity, description and recommendation.
+    #>
+    param (
+        [Parameter(Mandatory)]
+        [string]$Key,
+
+        [Parameter(Mandatory)]
+        [string]$Title,
+
+        [Parameter(Mandatory)]
+        [ValidateSet("Users", "Computers")]
+        [string]$Category,
+
+        [Parameter(Mandatory)]
+        [ValidateSet("Critical", "High", "Medium", "Low", "Info")]
+        [string]$Severity,
+
+        [Parameter(Mandatory)]
+        [string]$Description,
+
+        [Parameter(Mandatory)]
+        [string]$Recommendation,
+
+        [Parameter(Mandatory)]
+        [object[]]$Columns,
+
+        [Parameter()]
+        [AllowNull()]
+        [object[]]$Rows = @(),
+
+        [Parameter(Mandatory)]
+        [string]$CsvDirectory,
+
+        [Parameter(Mandatory)]
+        [string]$CsvName,
+
+        [Parameter()]
+        [int]$MaxDisplay = 200,
+
+        [Parameter()]
+        [string]$Note = ""
+    )
+
+    $RowArray = @($Rows)
+    $CsvPath = Join-Path $CsvDirectory $CsvName
+
+    if ($RowArray.Count -gt 0) {
+        $RowArray |
+            Export-Csv `
+                -Path $CsvPath `
+                -NoTypeInformation `
+                -Encoding UTF8
+    }
+    else {
+        # Header-only file so the evidence set is explicit about a check
+        # that ran and found nothing (versus a check that did not run).
+        (@($Columns | ForEach-Object { $_.key }) -join ",") |
+            Set-Content -LiteralPath $CsvPath -Encoding UTF8
+    }
+
+    $Displayed = @($RowArray | Select-Object -First $MaxDisplay)
+
+    Write-AuditLog ("Check '{0}': {1} result(s)." -f $Title, $RowArray.Count)
+
+    return [PSCustomObject]@{
+        key            = $Key
+        title          = $Title
+        category       = $Category
+        severity       = $Severity
+        description    = $Description
+        recommendation = $Recommendation
+        columns        = $Columns
+        count          = $RowArray.Count
+        displayedCount = $Displayed.Count
+        truncated      = ($RowArray.Count -gt $MaxDisplay)
+        rows           = $Displayed
+        note           = $Note
+        csv            = $CsvName
+    }
+}
+
 ###########################################################################
 # Validate required modules
 ###########################################################################
@@ -838,6 +1104,9 @@ try {
         MaxGroupMembersToDisplay     = $MaxGroupMembersToDisplay
         GroupMembershipQueryDelayMs  = $GroupMembershipQueryDelayMs
         MaxGroupNestingDepth         = $MaxGroupNestingDepth
+        OldPasswordThresholdDays     = $OldPasswordThresholdDays
+        InactiveAccountThresholdDays = $InactiveAccountThresholdDays
+        MaxAccountRowsToDisplay      = $MaxAccountRowsToDisplay
     }
 
     $Metadata |
@@ -2210,6 +2479,688 @@ try {
     ).Count
 
     #######################################################################
+    # Collect user- and computer-level security checks
+    #
+    # These feed the "Users" and "Computers" dashboard tabs and produce one
+    # CSV per check. Users and computers are each read once (with all
+    # required properties) and every check is derived in memory to limit AD
+    # load. Only the ActiveDirectory module is used.
+    #######################################################################
+
+    Write-AuditLog "Collecting user and computer security checks."
+
+    $Now = Get-Date
+    $OldPasswordCutoff = $Now.AddDays(-$OldPasswordThresholdDays)
+    $InactiveCutoff = $Now.AddDays(-$InactiveAccountThresholdDays)
+    $CsvDir = $Directories.Csv
+
+    # Set of DNs that are members (direct or nested) of any administrative
+    # group, used to flag privileged service accounts.
+    $AdminMemberDnSet = @{}
+    foreach ($AdminGroupName in $MatrixGroupNames) {
+        foreach ($AdminMemberDn in $AdminMembershipLookup[$AdminGroupName].Keys) {
+            $AdminMemberDnSet[$AdminMemberDn] = $true
+        }
+    }
+
+    # Detect LAPS expiration attributes in the schema so computers are only
+    # queried for them when LAPS is actually deployed (querying a schema
+    # attribute that does not exist would throw).
+    $LapsExpirationAttributes = @()
+    try {
+        $SchemaNamingContext = (Get-ADRootDSE -Server $DomainController).schemaNamingContext
+
+        $LapsExpirationAttributes = @(
+            Get-ADObject `
+                -SearchBase $SchemaNamingContext `
+                -Server $DomainController `
+                -LDAPFilter "(|(lDAPDisplayName=ms-Mcs-AdmPwdExpirationTime)(lDAPDisplayName=msLAPS-PasswordExpirationTime))" `
+                -Properties lDAPDisplayName |
+            ForEach-Object { [string]$_.lDAPDisplayName }
+        )
+    }
+    catch {
+        Write-AuditLog `
+            -Level "WARNING" `
+            -Message ("Could not query the schema for LAPS attributes: {0}" -f $_.Exception.Message)
+    }
+
+    $LapsSchemaPresent = ($LapsExpirationAttributes.Count -gt 0)
+
+    #######################################################################
+    # Read all users and computers once
+    #######################################################################
+
+    $UserProperties = @(
+        "SamAccountName", "Enabled", "PasswordLastSet", "PasswordNeverExpires",
+        "ServicePrincipalName", "DoesNotRequirePreAuth", "TrustedForDelegation",
+        "TrustedToAuthForDelegation", "msDS-AllowedToDelegateTo", "AdminCount",
+        "SIDHistory", "msDS-SupportedEncryptionTypes", "LastLogonDate",
+        "AccountNotDelegated", "UseDESKeyOnly"
+    )
+
+    $AllUsers = @(
+        Get-ADUser -Filter * -Server $DomainController -Properties $UserProperties
+    )
+    Write-AuditLog "Retrieved $($AllUsers.Count) user account(s)."
+
+    $ComputerProperties = @(
+        "SamAccountName", "Enabled", "OperatingSystem", "OperatingSystemVersion",
+        "LastLogonDate", "PasswordLastSet", "TrustedForDelegation",
+        "TrustedToAuthForDelegation", "msDS-AllowedToDelegateTo",
+        "msDS-AllowedToActOnBehalfOfOtherIdentity", "msDS-SupportedEncryptionTypes",
+        "SIDHistory", "PrimaryGroupID", "UseDESKeyOnly"
+    ) + $LapsExpirationAttributes
+
+    $AllComputers = @(
+        Get-ADComputer -Filter * -Server $DomainController -Properties $ComputerProperties
+    )
+    Write-AuditLog "Retrieved $($AllComputers.Count) computer account(s)."
+
+    $DomainControllerHostNames = @{}
+    foreach ($DcRow in $DomainControllerInventory) {
+        if (-not [string]::IsNullOrWhiteSpace($DcRow.Name)) {
+            $DomainControllerHostNames[[string]$DcRow.Name] = $true
+        }
+    }
+
+    #######################################################################
+    # Reusable column definitions
+    #######################################################################
+
+    $ColName     = [PSCustomObject]@{ key = "name";                label = "Name" }
+    $ColSam      = [PSCustomObject]@{ key = "sam";                 label = "SamAccountName" }
+    $ColType     = [PSCustomObject]@{ key = "type";                label = "Type" }
+    $ColEnabled  = [PSCustomObject]@{ key = "enabled";             label = "Enabled" }
+    $ColPls      = [PSCustomObject]@{ key = "passwordLastSet";     label = "PasswordLastSet" }
+    $ColLastLog  = [PSCustomObject]@{ key = "lastLogonDate";       label = "LastLogonDate" }
+    $ColOs       = [PSCustomObject]@{ key = "operatingSystem";     label = "Operating system" }
+    $ColEnc      = [PSCustomObject]@{ key = "supportedEncryption"; label = "Supported encryption" }
+
+    #######################################################################
+    # Per-check row collections
+    #######################################################################
+
+    $KerberoastRows        = New-Object System.Collections.Generic.List[object]
+    $AsrepRows             = New-Object System.Collections.Generic.List[object]
+    $PwdNeverExpiresRows   = New-Object System.Collections.Generic.List[object]
+    $OldPasswordRows       = New-Object System.Collections.Generic.List[object]
+    $AdminCountRows        = New-Object System.Collections.Generic.List[object]
+    $UserSidHistoryRows    = New-Object System.Collections.Generic.List[object]
+    $UserUnconstrainedRows = New-Object System.Collections.Generic.List[object]
+    $UserConstrainedRows   = New-Object System.Collections.Generic.List[object]
+    $UserNoAesRows         = New-Object System.Collections.Generic.List[object]
+    $UserDesRows           = New-Object System.Collections.Generic.List[object]
+    $InactiveUserRows      = New-Object System.Collections.Generic.List[object]
+    $DisabledUserRows      = New-Object System.Collections.Generic.List[object]
+    $ServiceAccountRows    = New-Object System.Collections.Generic.List[object]
+    $SensitiveRows         = New-Object System.Collections.Generic.List[object]
+
+    $CompUnconstrainedRows = New-Object System.Collections.Generic.List[object]
+    $CompConstrainedRows   = New-Object System.Collections.Generic.List[object]
+    $RbcdRows              = New-Object System.Collections.Generic.List[object]
+    $CompNoAesRows         = New-Object System.Collections.Generic.List[object]
+    $CompDesRows           = New-Object System.Collections.Generic.List[object]
+    $InactiveComputerRows  = New-Object System.Collections.Generic.List[object]
+    $DisabledComputerRows  = New-Object System.Collections.Generic.List[object]
+    $CompSidHistoryRows    = New-Object System.Collections.Generic.List[object]
+    $LapsMissingRows       = New-Object System.Collections.Generic.List[object]
+
+    $DelegationOverviewRows = New-Object System.Collections.Generic.List[object]
+
+    #######################################################################
+    # Evaluate every user account
+    #######################################################################
+
+    foreach ($User in $AllUsers) {
+        $UserName         = [string]$User.Name
+        $UserSam          = [string]$User.SamAccountName
+        $UserEnabled      = [bool]$User.Enabled
+        $UserEnabledText  = Get-YesNo -Value $UserEnabled
+        $UserDn           = [string]$User.DistinguishedName
+        $UserPwdLastSet   = Get-AdProp -Object $User -Name "PasswordLastSet"
+        $UserPwdNever     = [bool](Get-AdProp -Object $User -Name "PasswordNeverExpires")
+        $UserSpns         = Get-AdMultiValue -Object $User -Name "ServicePrincipalName"
+        $UserNoPreauth    = [bool](Get-AdProp -Object $User -Name "DoesNotRequirePreAuth")
+        $UserUnconstr     = [bool](Get-AdProp -Object $User -Name "TrustedForDelegation")
+        $UserProtocolTr   = [bool](Get-AdProp -Object $User -Name "TrustedToAuthForDelegation")
+        $UserDelegateTo   = Get-AdMultiValue -Object $User -Name "msDS-AllowedToDelegateTo"
+        $UserAdminCount   = Get-AdProp -Object $User -Name "AdminCount"
+        $UserSidHistory   = Get-AdMultiValue -Object $User -Name "SIDHistory"
+        $UserLastLogon    = Get-AdProp -Object $User -Name "LastLogonDate"
+        $UserNotDelegated = [bool](Get-AdProp -Object $User -Name "AccountNotDelegated")
+        $UserDesOnly      = [bool](Get-AdProp -Object $User -Name "UseDESKeyOnly")
+        $UserEnc = Get-KerberosEncryptionInfo `
+            -EncryptionTypes (Get-AdProp -Object $User -Name "msDS-SupportedEncryptionTypes") `
+            -UseDesKeyOnly $UserDesOnly
+        $UserIsPrivileged = $AdminMemberDnSet.ContainsKey($UserDn)
+
+        $UserPwdAgeDays = ""
+        if ($null -ne $UserPwdLastSet) {
+            $UserPwdAgeDays = [int]([Math]::Floor((New-TimeSpan -Start $UserPwdLastSet -End $Now).TotalDays))
+        }
+
+        if ($UserSpns.Count -gt 0) {
+            $KerberoastRows.Add([PSCustomObject]@{
+                name            = $UserName
+                sam             = $UserSam
+                enabled         = $UserEnabledText
+                passwordLastSet = (Format-DateValue $UserPwdLastSet)
+                spn             = ($UserSpns -join "; ")
+            })
+
+            $ServiceAccountRows.Add([PSCustomObject]@{
+                name                 = $UserName
+                sam                  = $UserSam
+                enabled              = $UserEnabledText
+                passwordLastSet      = (Format-DateValue $UserPwdLastSet)
+                passwordAgeDays      = $UserPwdAgeDays
+                passwordNeverExpires = (Get-YesNo -Value $UserPwdNever)
+                privileged           = (Get-YesNo -Value $UserIsPrivileged)
+                spnCount             = $UserSpns.Count
+            })
+        }
+
+        if ($UserNoPreauth) {
+            $AsrepRows.Add([PSCustomObject]@{
+                name = $UserName; sam = $UserSam; enabled = $UserEnabledText
+            })
+        }
+
+        if ($UserPwdNever) {
+            $PwdNeverExpiresRows.Add([PSCustomObject]@{
+                name = $UserName; sam = $UserSam
+                enabled = $UserEnabledText
+                passwordLastSet = (Format-DateValue $UserPwdLastSet)
+            })
+        }
+
+        if ($null -ne $UserPwdLastSet -and $UserPwdLastSet -lt $OldPasswordCutoff) {
+            $OldPasswordRows.Add([PSCustomObject]@{
+                name = $UserName; sam = $UserSam
+                enabled = $UserEnabledText
+                passwordLastSet = (Format-DateValue $UserPwdLastSet)
+                passwordAgeDays = $UserPwdAgeDays
+            })
+        }
+
+        if ($UserAdminCount -eq 1) {
+            $AdminCountRows.Add([PSCustomObject]@{
+                name = $UserName; sam = $UserSam
+                enabled = $UserEnabledText
+                adminCount = "1"
+            })
+        }
+
+        if ($UserSidHistory.Count -gt 0) {
+            $UserSidHistoryRows.Add([PSCustomObject]@{
+                name = $UserName; sam = $UserSam
+                enabled = $UserEnabledText
+                sidHistory = (@($UserSidHistory | ForEach-Object { [string]$_ }) -join "; ")
+            })
+        }
+
+        if ($UserUnconstr) {
+            $UserUnconstrainedRows.Add([PSCustomObject]@{
+                name = $UserName; sam = $UserSam; enabled = $UserEnabledText
+            })
+            $DelegationOverviewRows.Add([PSCustomObject]@{
+                object = $UserName; type = "User"; sam = $UserSam
+                delegationType = "Unconstrained"
+                details = "TrustedForDelegation = True"
+            })
+        }
+
+        if ($UserDelegateTo.Count -gt 0) {
+            $UserDelegationLabel = "Constrained"
+            if ($UserProtocolTr) { $UserDelegationLabel = "Constrained (protocol transition)" }
+
+            $UserConstrainedRows.Add([PSCustomObject]@{
+                name = $UserName; sam = $UserSam
+                enabled = $UserEnabledText
+                protocolTransition = (Get-YesNo -Value $UserProtocolTr)
+                allowedToDelegateTo = ($UserDelegateTo -join "; ")
+            })
+            $DelegationOverviewRows.Add([PSCustomObject]@{
+                object = $UserName; type = "User"; sam = $UserSam
+                delegationType = $UserDelegationLabel
+                details = ($UserDelegateTo -join "; ")
+            })
+        }
+
+        if ($UserEnc.Configured -and -not $UserEnc.Aes) {
+            $UserNoAesRows.Add([PSCustomObject]@{
+                name = $UserName; sam = $UserSam
+                enabled = $UserEnabledText
+                supportedEncryption = $UserEnc.Label
+            })
+        }
+
+        if ($UserEnc.Des) {
+            $UserDesRows.Add([PSCustomObject]@{
+                name = $UserName; sam = $UserSam
+                enabled = $UserEnabledText
+                supportedEncryption = $UserEnc.Label
+            })
+        }
+
+        if ($UserEnabled -and $null -ne $UserLastLogon -and $UserLastLogon -lt $InactiveCutoff) {
+            $InactiveUserRows.Add([PSCustomObject]@{
+                name = $UserName; sam = $UserSam
+                enabled = $UserEnabledText
+                lastLogonDate = (Format-DateValue $UserLastLogon)
+            })
+        }
+
+        if (-not $UserEnabled) {
+            $DisabledUserRows.Add([PSCustomObject]@{
+                name = $UserName; sam = $UserSam
+                lastLogonDate = (Format-DateValue $UserLastLogon)
+            })
+        }
+
+        if ($UserNotDelegated) {
+            $SensitiveRows.Add([PSCustomObject]@{
+                name = $UserName; sam = $UserSam; enabled = $UserEnabledText
+            })
+        }
+    }
+
+    #######################################################################
+    # Evaluate every computer account
+    #######################################################################
+
+    foreach ($Computer in $AllComputers) {
+        $CompName        = [string]$Computer.Name
+        $CompSam         = [string]$Computer.SamAccountName
+        $CompEnabled     = [bool]$Computer.Enabled
+        $CompEnabledText = Get-YesNo -Value $CompEnabled
+        $CompOs          = [string](Get-AdProp -Object $Computer -Name "OperatingSystem")
+        $CompLastLogon   = Get-AdProp -Object $Computer -Name "LastLogonDate"
+        $CompUnconstr    = [bool](Get-AdProp -Object $Computer -Name "TrustedForDelegation")
+        $CompProtocolTr  = [bool](Get-AdProp -Object $Computer -Name "TrustedToAuthForDelegation")
+        $CompDelegateTo  = Get-AdMultiValue -Object $Computer -Name "msDS-AllowedToDelegateTo"
+        $CompRbcd        = Get-AdProp -Object $Computer -Name "msDS-AllowedToActOnBehalfOfOtherIdentity"
+        $CompSidHistory  = Get-AdMultiValue -Object $Computer -Name "SIDHistory"
+        $CompDesOnly     = [bool](Get-AdProp -Object $Computer -Name "UseDESKeyOnly")
+        $CompEnc = Get-KerberosEncryptionInfo `
+            -EncryptionTypes (Get-AdProp -Object $Computer -Name "msDS-SupportedEncryptionTypes") `
+            -UseDesKeyOnly $CompDesOnly
+        $CompPrimaryGroup = Get-AdProp -Object $Computer -Name "PrimaryGroupID"
+        $CompIsDc = (
+            $CompPrimaryGroup -eq 516 -or
+            $CompPrimaryGroup -eq 521 -or
+            $DomainControllerHostNames.ContainsKey($CompName)
+        )
+
+        if ($CompUnconstr) {
+            $CompUnconstrainedRows.Add([PSCustomObject]@{
+                name = $CompName
+                enabled = $CompEnabledText
+                operatingSystem = $CompOs
+                isDomainController = (Get-YesNo -Value $CompIsDc)
+            })
+            $DelegationDetail = "TrustedForDelegation = True"
+            if ($CompIsDc) { $DelegationDetail = "Domain controller (expected)" }
+            $DelegationOverviewRows.Add([PSCustomObject]@{
+                object = $CompName; type = "Computer"; sam = $CompSam
+                delegationType = "Unconstrained"
+                details = $DelegationDetail
+            })
+        }
+
+        if ($CompDelegateTo.Count -gt 0) {
+            $CompDelegationLabel = "Constrained"
+            if ($CompProtocolTr) { $CompDelegationLabel = "Constrained (protocol transition)" }
+
+            $CompConstrainedRows.Add([PSCustomObject]@{
+                name = $CompName
+                enabled = $CompEnabledText
+                protocolTransition = (Get-YesNo -Value $CompProtocolTr)
+                allowedToDelegateTo = ($CompDelegateTo -join "; ")
+            })
+            $DelegationOverviewRows.Add([PSCustomObject]@{
+                object = $CompName; type = "Computer"; sam = $CompSam
+                delegationType = $CompDelegationLabel
+                details = ($CompDelegateTo -join "; ")
+            })
+        }
+
+        if ($null -ne $CompRbcd) {
+            $RbcdRows.Add([PSCustomObject]@{
+                name = $CompName
+                enabled = $CompEnabledText
+                note = "msDS-AllowedToActOnBehalfOfOtherIdentity is set"
+            })
+            $DelegationOverviewRows.Add([PSCustomObject]@{
+                object = $CompName; type = "Computer"; sam = $CompSam
+                delegationType = "Resource-based constrained (RBCD)"
+                details = "msDS-AllowedToActOnBehalfOfOtherIdentity is set"
+            })
+        }
+
+        if ($CompEnc.Configured -and -not $CompEnc.Aes) {
+            $CompNoAesRows.Add([PSCustomObject]@{
+                name = $CompName
+                enabled = $CompEnabledText
+                supportedEncryption = $CompEnc.Label
+            })
+        }
+
+        if ($CompEnc.Des) {
+            $CompDesRows.Add([PSCustomObject]@{
+                name = $CompName
+                enabled = $CompEnabledText
+                supportedEncryption = $CompEnc.Label
+            })
+        }
+
+        if ($CompEnabled -and $null -ne $CompLastLogon -and $CompLastLogon -lt $InactiveCutoff) {
+            $InactiveComputerRows.Add([PSCustomObject]@{
+                name = $CompName
+                operatingSystem = $CompOs
+                lastLogonDate = (Format-DateValue $CompLastLogon)
+            })
+        }
+
+        if (-not $CompEnabled) {
+            $DisabledComputerRows.Add([PSCustomObject]@{
+                name = $CompName
+                operatingSystem = $CompOs
+                lastLogonDate = (Format-DateValue $CompLastLogon)
+            })
+        }
+
+        if ($CompSidHistory.Count -gt 0) {
+            $CompSidHistoryRows.Add([PSCustomObject]@{
+                name = $CompName
+                enabled = $CompEnabledText
+                sidHistory = (@($CompSidHistory | ForEach-Object { [string]$_ }) -join "; ")
+            })
+        }
+
+        if ($LapsSchemaPresent -and $CompEnabled -and -not $CompIsDc) {
+            $HasLaps = $false
+            foreach ($LapsAttr in $LapsExpirationAttributes) {
+                if ($null -ne (Get-AdProp -Object $Computer -Name $LapsAttr)) {
+                    $HasLaps = $true
+                    break
+                }
+            }
+            if (-not $HasLaps) {
+                $LapsMissingRows.Add([PSCustomObject]@{
+                    name = $CompName
+                    operatingSystem = $CompOs
+                    enabled = $CompEnabledText
+                })
+            }
+        }
+    }
+
+    #######################################################################
+    # Privileged accounts (members of the core administrative groups) and
+    # Protected Users, derived from the group resolution done earlier
+    #######################################################################
+
+    $CoreAdminGroupNames = @(
+        "Domain Admins", "Enterprise Admins", "Schema Admins",
+        "Administrators (built-in)", "Account Operators",
+        "Server Operators", "Backup Operators"
+    )
+
+    $PrivilegedAccountRows = New-Object System.Collections.Generic.List[object]
+
+    foreach ($MemberDn in $PrivilegedUserInfo.Keys) {
+        $MemberOfGroups = New-Object System.Collections.Generic.List[string]
+
+        foreach ($CoreGroupName in $CoreAdminGroupNames) {
+            if (
+                $AdminMembershipLookup.ContainsKey($CoreGroupName) -and
+                $AdminMembershipLookup[$CoreGroupName].ContainsKey($MemberDn)
+            ) {
+                $MemberOfGroups.Add($CoreGroupName)
+            }
+        }
+
+        if ($MemberOfGroups.Count -gt 0) {
+            $MemberInfo = $PrivilegedUserInfo[$MemberDn]
+            $PrivilegedAccountRows.Add([PSCustomObject]@{
+                name     = [string]$MemberInfo.Name
+                sam      = [string]$MemberInfo.SamAccountName
+                type     = [string]$MemberInfo.ObjectClass
+                memberOf = ($MemberOfGroups -join "; ")
+            })
+        }
+    }
+
+    $PrivilegedAccountRows = @($PrivilegedAccountRows | Sort-Object name)
+
+    $ProtectedUserRows = New-Object System.Collections.Generic.List[object]
+
+    if ($ProtectedUsersResolution.Found) {
+        foreach ($ProtectedMemberRow in @($ProtectedUsersResolution.Members)) {
+            $ProtectedUserRows.Add([PSCustomObject]@{
+                name = [string]$ProtectedMemberRow.Name
+                sam  = [string]$ProtectedMemberRow.SamAccountName
+                type = [string]$ProtectedMemberRow.ObjectClass
+                via  = [string]$ProtectedMemberRow.Via
+            })
+        }
+    }
+
+    $ProtectedUsersNote = ""
+    if (-not $ProtectedUsersResolution.Found) {
+        $ProtectedUsersNote = "The Protected Users group could not be resolved: $($ProtectedUsersResolution.Error)"
+    }
+
+    #######################################################################
+    # Domain controller check (OS support and FSMO roles)
+    #######################################################################
+
+    $DomainControllerRows = New-Object System.Collections.Generic.List[object]
+    $AnyLegacyDomainController = $false
+
+    foreach ($Dc in $DomainControllerInventory) {
+        $DcLegacy = Test-LegacyOperatingSystem -OperatingSystem $Dc.OperatingSystem
+        if ($DcLegacy) { $AnyLegacyDomainController = $true }
+
+        $DcSupport = "Supported"
+        if ($DcLegacy) { $DcSupport = "Legacy / end-of-life" }
+
+        $DomainControllerRows.Add([PSCustomObject]@{
+            host = $Dc.HostName
+            operatingSystem = $Dc.OperatingSystem
+            osVersion = $Dc.OperatingSystemVersion
+            osSupport = $DcSupport
+            fsmoRoles = $Dc.OperationMasterRoles
+            globalCatalog = (Get-YesNo -Value ([bool]$Dc.IsGlobalCatalog))
+            readOnly = (Get-YesNo -Value ([bool]$Dc.IsReadOnly))
+        })
+    }
+
+    $DomainControllerSeverity = "Info"
+    if ($AnyLegacyDomainController) { $DomainControllerSeverity = "High" }
+
+    $LapsNote = ""
+    if (-not $LapsSchemaPresent) {
+        $LapsNote = "No LAPS schema attributes (ms-Mcs-AdmPwdExpirationTime / msLAPS-PasswordExpirationTime) were found. LAPS does not appear to be deployed, so per-computer coverage could not be evaluated."
+    }
+
+    #######################################################################
+    # Assemble all checks (order below is the display order per tab)
+    #######################################################################
+
+    $AccountChecks = New-Object System.Collections.Generic.List[object]
+
+    # ---- Users tab ----
+
+    $AccountChecks.Add((New-AccountCheck -Key "user-unconstrained" -Title "Unconstrained delegation (users)" -Category "Users" -Severity "Critical" `
+        -Description "User accounts trusted for unconstrained delegation. If compromised, an attacker can impersonate any user that authenticates to them, including domain admins." `
+        -Recommendation "Remove unconstrained delegation from user accounts. Where delegation is required, use constrained delegation or resource-based constrained delegation, and add sensitive accounts to Protected Users." `
+        -Columns @($ColName, $ColSam, $ColEnabled) -Rows $UserUnconstrainedRows.ToArray() `
+        -CsvDirectory $CsvDir -CsvName "Check-Users-Unconstrained-Delegation.csv" -MaxDisplay $MaxAccountRowsToDisplay))
+
+    $AccountChecks.Add((New-AccountCheck -Key "service-accounts" -Title "Service accounts (SPN)" -Category "Users" -Severity "High" `
+        -Description "Accounts with a Service Principal Name, flagged for password-never-expires, password age and privileged group membership." `
+        -Recommendation "Prefer group-managed service accounts (gMSA). Ensure long (25+ character) random passwords, AES encryption, least privilege, and remove privileged group membership where not required." `
+        -Columns @($ColName, $ColSam, $ColEnabled, $ColPls, [PSCustomObject]@{ key = "passwordAgeDays"; label = "Password age (days)" }, [PSCustomObject]@{ key = "passwordNeverExpires"; label = "Never expires" }, [PSCustomObject]@{ key = "privileged"; label = "Privileged" }, [PSCustomObject]@{ key = "spnCount"; label = "SPN count" }) `
+        -Rows $ServiceAccountRows.ToArray() -CsvDirectory $CsvDir -CsvName "Check-Service-Accounts.csv" -MaxDisplay $MaxAccountRowsToDisplay))
+
+    $AccountChecks.Add((New-AccountCheck -Key "kerberoastable" -Title "Kerberoastable accounts (SPN)" -Category "Users" -Severity "High" `
+        -Description "User accounts with a Service Principal Name. Any authenticated user can request their service tickets, which are encrypted with the account's password hash and can be cracked offline." `
+        -Recommendation "Use gMSA where possible; otherwise enforce long random passwords and AES-only encryption, and remove unnecessary SPNs." `
+        -Columns @($ColName, $ColSam, $ColEnabled, $ColPls, [PSCustomObject]@{ key = "spn"; label = "ServicePrincipalName" }) `
+        -Rows $KerberoastRows.ToArray() -CsvDirectory $CsvDir -CsvName "Check-Kerberoastable-Accounts.csv" -MaxDisplay $MaxAccountRowsToDisplay))
+
+    $AccountChecks.Add((New-AccountCheck -Key "asrep-roastable" -Title "AS-REP roastable accounts" -Category "Users" -Severity "High" `
+        -Description "Accounts configured with 'Do not require Kerberos preauthentication'. An attacker can request an AS-REP and crack it offline without any credentials." `
+        -Recommendation "Enable Kerberos preauthentication on these accounts unless a documented legacy requirement exists." `
+        -Columns @($ColName, $ColSam, $ColEnabled) -Rows $AsrepRows.ToArray() `
+        -CsvDirectory $CsvDir -CsvName "Check-ASREP-Roastable-Accounts.csv" -MaxDisplay $MaxAccountRowsToDisplay))
+
+    $AccountChecks.Add((New-AccountCheck -Key "privileged-accounts" -Title "Privileged accounts" -Category "Users" -Severity "High" `
+        -Description "Members (direct or nested) of the core administrative groups: Domain Admins, Enterprise Admins, Schema Admins, Administrators, Account Operators, Server Operators and Backup Operators." `
+        -Recommendation "Keep these groups as small as possible, use dedicated admin accounts, add them to Protected Users, and review membership regularly." `
+        -Columns @($ColName, $ColSam, $ColType, [PSCustomObject]@{ key = "memberOf"; label = "Member of" }) `
+        -Rows $PrivilegedAccountRows -CsvDirectory $CsvDir -CsvName "Check-Privileged-Accounts.csv" -MaxDisplay $MaxAccountRowsToDisplay))
+
+    $AccountChecks.Add((New-AccountCheck -Key "user-sidhistory" -Title "Accounts with SIDHistory" -Category "Users" -Severity "High" `
+        -Description "User accounts that carry a SIDHistory attribute. SIDHistory can grant hidden, inherited access and is a known persistence and privilege-escalation technique." `
+        -Recommendation "Review why SIDHistory is present. Remove it after migrations are complete unless there is a documented need." `
+        -Columns @($ColName, $ColSam, $ColEnabled, [PSCustomObject]@{ key = "sidHistory"; label = "SIDHistory" }) `
+        -Rows $UserSidHistoryRows.ToArray() -CsvDirectory $CsvDir -CsvName "Check-Users-SIDHistory.csv" -MaxDisplay $MaxAccountRowsToDisplay))
+
+    $AccountChecks.Add((New-AccountCheck -Key "user-des" -Title "DES encryption allowed (users)" -Category "Users" -Severity "High" `
+        -Description "Accounts that allow DES Kerberos encryption (via msDS-SupportedEncryptionTypes DES bits or UseDESKeyOnly). DES is cryptographically broken." `
+        -Recommendation "Remove DES support and configure AES-only encryption on these accounts." `
+        -Columns @($ColName, $ColSam, $ColEnabled, $ColEnc) -Rows $UserDesRows.ToArray() `
+        -CsvDirectory $CsvDir -CsvName "Check-Users-DES-Allowed.csv" -MaxDisplay $MaxAccountRowsToDisplay))
+
+    $AccountChecks.Add((New-AccountCheck -Key "user-constrained" -Title "Constrained delegation (users)" -Category "Users" -Severity "High" `
+        -Description "User accounts with msDS-AllowedToDelegateTo set. These can impersonate users to the listed services (and to any service on the same host when protocol transition is enabled)." `
+        -Recommendation "Confirm each delegation is still required and least-privilege. Prefer resource-based constrained delegation, and protect sensitive target services." `
+        -Columns @($ColName, $ColSam, $ColEnabled, [PSCustomObject]@{ key = "protocolTransition"; label = "Protocol transition" }, [PSCustomObject]@{ key = "allowedToDelegateTo"; label = "Allowed to delegate to" }) `
+        -Rows $UserConstrainedRows.ToArray() -CsvDirectory $CsvDir -CsvName "Check-Users-Constrained-Delegation.csv" -MaxDisplay $MaxAccountRowsToDisplay))
+
+    $AccountChecks.Add((New-AccountCheck -Key "user-no-aes" -Title "Accounts without AES (users)" -Category "Users" -Severity "Medium" `
+        -Description "Accounts whose msDS-SupportedEncryptionTypes is configured but does not include AES128 or AES256 (RC4/DES only)." `
+        -Recommendation "Configure AES128 and AES256 support; remove RC4/DES where compatibility allows." `
+        -Columns @($ColName, $ColSam, $ColEnabled, $ColEnc) -Rows $UserNoAesRows.ToArray() `
+        -CsvDirectory $CsvDir -CsvName "Check-Users-No-AES.csv" -MaxDisplay $MaxAccountRowsToDisplay))
+
+    $AccountChecks.Add((New-AccountCheck -Key "admincount" -Title "Protected accounts (AdminCount = 1)" -Category "Users" -Severity "Medium" `
+        -Description "Accounts with AdminCount = 1. These are (or were) protected by AdminSDHolder. A set AdminCount on a non-privileged account can indicate stale or leftover privileged access." `
+        -Recommendation "Verify each account still requires privileged access. For former admins, clear AdminCount and restore inheritance after removing them from privileged groups." `
+        -Columns @($ColName, $ColSam, $ColEnabled, [PSCustomObject]@{ key = "adminCount"; label = "AdminCount" }) `
+        -Rows $AdminCountRows.ToArray() -CsvDirectory $CsvDir -CsvName "Check-AdminCount-Accounts.csv" -MaxDisplay $MaxAccountRowsToDisplay))
+
+    $AccountChecks.Add((New-AccountCheck -Key "password-never-expires" -Title "Password never expires" -Category "Users" -Severity "Medium" `
+        -Description "Accounts with PasswordNeverExpires = True. Their passwords are never forced to change." `
+        -Recommendation "Remove the flag where possible. For service accounts that require it, use gMSA or enforce long random passwords with a rotation process." `
+        -Columns @($ColName, $ColSam, $ColEnabled, $ColPls) -Rows $PwdNeverExpiresRows.ToArray() `
+        -CsvDirectory $CsvDir -CsvName "Check-Password-Never-Expires.csv" -MaxDisplay $MaxAccountRowsToDisplay))
+
+    $AccountChecks.Add((New-AccountCheck -Key "old-passwords" -Title "Old passwords (> $OldPasswordThresholdDays days)" -Category "Users" -Severity "Medium" `
+        -Description "Accounts whose PasswordLastSet is older than $OldPasswordThresholdDays days." `
+        -Recommendation "Investigate stale accounts and rotate or disable them. Long-lived passwords increase exposure to offline cracking." `
+        -Columns @($ColName, $ColSam, $ColEnabled, $ColPls, [PSCustomObject]@{ key = "passwordAgeDays"; label = "Password age (days)" }) `
+        -Rows $OldPasswordRows.ToArray() -CsvDirectory $CsvDir -CsvName "Check-Old-Passwords.csv" -MaxDisplay $MaxAccountRowsToDisplay))
+
+    $AccountChecks.Add((New-AccountCheck -Key "inactive-users" -Title "Inactive accounts (> $InactiveAccountThresholdDays days)" -Category "Users" -Severity "Medium" `
+        -Description "Enabled accounts whose LastLogonDate is older than $InactiveAccountThresholdDays days." `
+        -Recommendation "Disable or remove accounts that are no longer used. Stale enabled accounts widen the attack surface." `
+        -Columns @($ColName, $ColSam, $ColEnabled, $ColLastLog) -Rows $InactiveUserRows.ToArray() `
+        -CsvDirectory $CsvDir -CsvName "Check-Inactive-Users.csv" -MaxDisplay $MaxAccountRowsToDisplay))
+
+    $AccountChecks.Add((New-AccountCheck -Key "sensitive-not-delegated" -Title "Sensitive - cannot be delegated" -Category "Users" -Severity "Info" `
+        -Description "Accounts flagged 'Account is sensitive and cannot be delegated' (NOT_DELEGATED). This is a hardening control; the list is provided for verification of coverage." `
+        -Recommendation "Ensure all highly privileged accounts carry this flag (or are in Protected Users) so they cannot be delegated." `
+        -Columns @($ColName, $ColSam, $ColEnabled) -Rows $SensitiveRows.ToArray() `
+        -CsvDirectory $CsvDir -CsvName "Check-Sensitive-Cannot-Be-Delegated.csv" -MaxDisplay $MaxAccountRowsToDisplay))
+
+    $AccountChecks.Add((New-AccountCheck -Key "protected-users" -Title "Protected Users members" -Category "Users" -Severity "Info" `
+        -Description "Members of the Protected Users group. Membership hardens accounts (no NTLM, no delegation, no RC4/DES), but breaks accounts that depend on those. Also shown on the Privileged access tab." `
+        -Recommendation "Add highly privileged interactive accounts to Protected Users after confirming they do not rely on unsupported authentication." `
+        -Columns @($ColName, $ColSam, $ColType, [PSCustomObject]@{ key = "via"; label = "Via" }) `
+        -Rows $ProtectedUserRows.ToArray() -CsvDirectory $CsvDir -CsvName "Check-Protected-Users.csv" -MaxDisplay $MaxAccountRowsToDisplay -Note $ProtectedUsersNote))
+
+    $AccountChecks.Add((New-AccountCheck -Key "disabled-users" -Title "Disabled accounts" -Category "Users" -Severity "Low" `
+        -Description "User accounts that are disabled (Enabled = False)." `
+        -Recommendation "Remove disabled accounts that are no longer needed to keep the directory clean and reduce the attack surface." `
+        -Columns @($ColName, $ColSam, $ColLastLog) -Rows $DisabledUserRows.ToArray() `
+        -CsvDirectory $CsvDir -CsvName "Check-Disabled-Users.csv" -MaxDisplay $MaxAccountRowsToDisplay))
+
+    # ---- Computers tab ----
+
+    $AccountChecks.Add((New-AccountCheck -Key "computer-unconstrained" -Title "Unconstrained delegation (computers)" -Category "Computers" -Severity "Critical" `
+        -Description "Computers trusted for unconstrained delegation. If compromised, an attacker can capture and reuse the TGTs of any user that connects, including domain admins. Domain controllers hold this legitimately and are flagged as such." `
+        -Recommendation "Remove unconstrained delegation from member servers. Use constrained or resource-based constrained delegation, and add sensitive accounts to Protected Users." `
+        -Columns @($ColName, $ColEnabled, $ColOs, [PSCustomObject]@{ key = "isDomainController"; label = "Domain controller" }) `
+        -Rows $CompUnconstrainedRows.ToArray() -CsvDirectory $CsvDir -CsvName "Check-Computers-Unconstrained-Delegation.csv" -MaxDisplay $MaxAccountRowsToDisplay))
+
+    $AccountChecks.Add((New-AccountCheck -Key "rbcd" -Title "Resource-based constrained delegation (RBCD)" -Category "Computers" -Severity "High" `
+        -Description "Computers with msDS-AllowedToActOnBehalfOfOtherIdentity set. Other principals are allowed to impersonate users to this computer; a writable value is a common lateral-movement and privilege-escalation vector." `
+        -Recommendation "Review the configured principals on each object and remove entries that are not required. Restrict who can write this attribute." `
+        -Columns @($ColName, $ColEnabled, [PSCustomObject]@{ key = "note"; label = "Detail" }) `
+        -Rows $RbcdRows.ToArray() -CsvDirectory $CsvDir -CsvName "Check-Computers-RBCD.csv" -MaxDisplay $MaxAccountRowsToDisplay))
+
+    $AccountChecks.Add((New-AccountCheck -Key "computer-constrained" -Title "Constrained delegation (computers)" -Category "Computers" -Severity "High" `
+        -Description "Computers with msDS-AllowedToDelegateTo set. These can impersonate users to the listed services (and to any service on the same host when protocol transition is enabled)." `
+        -Recommendation "Confirm each delegation is still required and least-privilege. Prefer resource-based constrained delegation and protect sensitive target services." `
+        -Columns @($ColName, $ColEnabled, [PSCustomObject]@{ key = "protocolTransition"; label = "Protocol transition" }, [PSCustomObject]@{ key = "allowedToDelegateTo"; label = "Allowed to delegate to" }) `
+        -Rows $CompConstrainedRows.ToArray() -CsvDirectory $CsvDir -CsvName "Check-Computers-Constrained-Delegation.csv" -MaxDisplay $MaxAccountRowsToDisplay))
+
+    $AccountChecks.Add((New-AccountCheck -Key "delegation-overview" -Title "Kerberos delegation overview (users & computers)" -Category "Computers" -Severity "High" `
+        -Description "Combined view of every object configured for Kerberos delegation: unconstrained, constrained (with or without protocol transition) and resource-based constrained delegation." `
+        -Recommendation "Treat delegation as high-value configuration. Remove unconstrained delegation, minimise constrained/RBCD scope, and monitor changes to these attributes." `
+        -Columns @([PSCustomObject]@{ key = "object"; label = "Object" }, [PSCustomObject]@{ key = "type"; label = "Type" }, [PSCustomObject]@{ key = "sam"; label = "SamAccountName" }, [PSCustomObject]@{ key = "delegationType"; label = "Delegation type" }, [PSCustomObject]@{ key = "details"; label = "Details" }) `
+        -Rows $DelegationOverviewRows.ToArray() -CsvDirectory $CsvDir -CsvName "Check-Kerberos-Delegation-Overview.csv" -MaxDisplay $MaxAccountRowsToDisplay))
+
+    $AccountChecks.Add((New-AccountCheck -Key "computer-des" -Title "DES encryption allowed (computers)" -Category "Computers" -Severity "High" `
+        -Description "Computers that allow DES Kerberos encryption (via msDS-SupportedEncryptionTypes DES bits or UseDESKeyOnly). DES is cryptographically broken." `
+        -Recommendation "Remove DES support and configure AES-only encryption." `
+        -Columns @($ColName, $ColEnabled, $ColEnc) -Rows $CompDesRows.ToArray() `
+        -CsvDirectory $CsvDir -CsvName "Check-Computers-DES-Allowed.csv" -MaxDisplay $MaxAccountRowsToDisplay))
+
+    $AccountChecks.Add((New-AccountCheck -Key "computer-sidhistory" -Title "Computers with SIDHistory" -Category "Computers" -Severity "High" `
+        -Description "Computer accounts that carry a SIDHistory attribute, which can grant hidden inherited access and is a known persistence technique." `
+        -Recommendation "Review why SIDHistory is present and remove it once migrations are complete unless documented as required." `
+        -Columns @($ColName, $ColEnabled, [PSCustomObject]@{ key = "sidHistory"; label = "SIDHistory" }) `
+        -Rows $CompSidHistoryRows.ToArray() -CsvDirectory $CsvDir -CsvName "Check-Computers-SIDHistory.csv" -MaxDisplay $MaxAccountRowsToDisplay))
+
+    $AccountChecks.Add((New-AccountCheck -Key "laps-missing" -Title "Computers without LAPS" -Category "Computers" -Severity "High" `
+        -Description "Enabled, non-domain-controller computers that have no LAPS password-expiration attribute set, meaning the local administrator password is likely not managed by LAPS." `
+        -Recommendation "Deploy LAPS (Windows LAPS or legacy) to all member computers so local administrator passwords are unique and rotated." `
+        -Columns @($ColName, $ColOs, $ColEnabled) -Rows $LapsMissingRows.ToArray() `
+        -CsvDirectory $CsvDir -CsvName "Check-Computers-Without-LAPS.csv" -MaxDisplay $MaxAccountRowsToDisplay -Note $LapsNote))
+
+    $AccountChecks.Add((New-AccountCheck -Key "computer-no-aes" -Title "Computers without AES" -Category "Computers" -Severity "Medium" `
+        -Description "Computers whose msDS-SupportedEncryptionTypes is configured but does not include AES128 or AES256 (RC4/DES only)." `
+        -Recommendation "Configure AES128 and AES256 support; remove RC4/DES where compatibility allows." `
+        -Columns @($ColName, $ColEnabled, $ColEnc) -Rows $CompNoAesRows.ToArray() `
+        -CsvDirectory $CsvDir -CsvName "Check-Computers-No-AES.csv" -MaxDisplay $MaxAccountRowsToDisplay))
+
+    $AccountChecks.Add((New-AccountCheck -Key "domain-controllers" -Title "Domain controllers" -Category "Computers" -Severity $DomainControllerSeverity `
+        -Description "Domain controller inventory with operating-system support status and FSMO role placement. Last-reboot time is not available through the ActiveDirectory module and is not shown here." `
+        -Recommendation "Upgrade domain controllers running legacy/end-of-life operating systems and keep them patched. Verify FSMO placement matches your design." `
+        -Columns @([PSCustomObject]@{ key = "host"; label = "Host" }, $ColOs, [PSCustomObject]@{ key = "osVersion"; label = "OS version" }, [PSCustomObject]@{ key = "osSupport"; label = "OS support" }, [PSCustomObject]@{ key = "fsmoRoles"; label = "FSMO roles" }, [PSCustomObject]@{ key = "globalCatalog"; label = "GC" }, [PSCustomObject]@{ key = "readOnly"; label = "RODC" }) `
+        -Rows $DomainControllerRows.ToArray() -CsvDirectory $CsvDir -CsvName "Check-Domain-Controllers.csv" -MaxDisplay $MaxAccountRowsToDisplay))
+
+    $AccountChecks.Add((New-AccountCheck -Key "inactive-computers" -Title "Inactive computers (> $InactiveAccountThresholdDays days)" -Category "Computers" -Severity "Medium" `
+        -Description "Enabled computer accounts whose LastLogonDate is older than $InactiveAccountThresholdDays days." `
+        -Recommendation "Disable or remove stale computer accounts. Orphaned computer objects can be abused and clutter the directory." `
+        -Columns @($ColName, $ColOs, $ColLastLog) -Rows $InactiveComputerRows.ToArray() `
+        -CsvDirectory $CsvDir -CsvName "Check-Inactive-Computers.csv" -MaxDisplay $MaxAccountRowsToDisplay))
+
+    $AccountChecks.Add((New-AccountCheck -Key "disabled-computers" -Title "Disabled computers" -Category "Computers" -Severity "Low" `
+        -Description "Computer accounts that are disabled (Enabled = False)." `
+        -Recommendation "Remove disabled computer accounts that are no longer needed." `
+        -Columns @($ColName, $ColOs, $ColLastLog) -Rows $DisabledComputerRows.ToArray() `
+        -CsvDirectory $CsvDir -CsvName "Check-Disabled-Computers.csv" -MaxDisplay $MaxAccountRowsToDisplay))
+
+    $AccountChecksArray = @($AccountChecks.ToArray())
+
+    #######################################################################
     # Build interactive HTML dashboard
     #
     # Combines configured findings, structural scope, security filtering
@@ -2577,6 +3528,7 @@ try {
                 users             = @($PrivilegedUserMatrix.ToArray())
             }
         }
+        accountChecks    = $AccountChecksArray
         gpos             = $DashboardGposArray
         scopeTargets     = $DashboardScopeTargetsArray
         groupMembers     = $GroupMembershipCache
@@ -2697,6 +3649,36 @@ footer { padding: 20px 32px 40px; color: var(--muted); font-size: 12px; border-t
 .check-none { color: #cbd5e1; }
 .not-protected { color: var(--partial); font-weight: 700; font-size: 15px; border-bottom: 1px dotted var(--partial); cursor: help; }
 .legend { margin: 10px 0 0; }
+.sev { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; white-space: nowrap; }
+.sev-critical { background: #fee2e2; color: #b91c1c; }
+.sev-high { background: var(--insecure-bg); color: var(--insecure); }
+.sev-medium { background: var(--partial-bg); color: var(--partial); }
+.sev-low { background: var(--unknown-bg); color: var(--unknown); }
+.sev-info { background: #e0edff; color: var(--accent); }
+.tab-intro { color: var(--muted); font-size: 13px; margin: 0 0 16px; }
+.check-overview { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 10px; margin-bottom: 20px; }
+.check-card { display: block; text-decoration: none; color: inherit; background: var(--surface); border: 1px solid var(--border); border-left: 4px solid var(--border); border-radius: 10px; padding: 12px 14px; }
+.check-card:hover { border-color: var(--accent); }
+.check-card-value { font-size: 24px; font-weight: 700; }
+.check-card-title { font-size: 12px; color: var(--muted); margin: 2px 0 8px; }
+.check-card.sev-critical { border-left-color: #b91c1c; }
+.check-card.sev-high { border-left-color: var(--insecure); }
+.check-card.sev-medium { border-left-color: var(--partial); }
+.check-card.sev-low { border-left-color: var(--unknown); }
+.check-card.sev-info { border-left-color: var(--accent); }
+.check-card.sev-none { opacity: 0.55; }
+.check-block { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; margin-bottom: 10px; overflow: hidden; }
+.check-block summary { padding: 14px 18px; cursor: pointer; display: flex; gap: 12px; align-items: center; list-style: none; flex-wrap: wrap; }
+.check-block summary::-webkit-details-marker { display: none; }
+.check-name { font-weight: 600; }
+.check-count { margin-left: auto; }
+.check-body { padding: 0 18px 18px; }
+.check-desc { font-size: 13px; margin: 0 0 10px; }
+.reco { font-size: 13px; background: #f8fafc; border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin: 10px 0; }
+.table-wrap { overflow-x: auto; }
+.data-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.data-table th, .data-table td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border); vertical-align: top; word-break: break-word; }
+.data-table th { font-size: 12px; color: var(--muted); white-space: nowrap; }
 @media (max-width: 720px) { .gpo-columns { grid-template-columns: 1fr; } }
 </style>
 </head>
@@ -2713,6 +3695,8 @@ footer { padding: 20px 32px 40px; color: var(--muted); font-size: 12px; border-t
 
 <nav class="tabs">
   <button class="tab-btn active" data-tab="overview">Domain overview</button>
+  <button class="tab-btn" data-tab="users">Users</button>
+  <button class="tab-btn" data-tab="computers">Computers</button>
   <button class="tab-btn" data-tab="privileged">Privileged access</button>
   <button class="tab-btn" data-tab="pwpolicy">Password policy</button>
   <button class="tab-btn" data-tab="policies">Group Policy</button>
@@ -2721,6 +3705,14 @@ footer { padding: 20px 32px 40px; color: var(--muted); font-size: 12px; border-t
 
 <section id="tab-overview" class="tab-panel active">
   <div id="overview-container"></div>
+</section>
+
+<section id="tab-users" class="tab-panel">
+  <div id="users-container"></div>
+</section>
+
+<section id="tab-computers" class="tab-panel">
+  <div id="computers-container"></div>
 </section>
 
 <section id="tab-policies" class="tab-panel">
@@ -2755,8 +3747,10 @@ footer { padding: 20px 32px 40px; color: var(--muted); font-size: 12px; border-t
 
 <footer>
   This is a point-in-time enumeration of the domain: its controllers and FSMO roles, privileged group
-  membership, Protected Users coverage, password policy, and the Group Policy settings that enforce (or fail to
-  enforce) key protections such as SMB signing and NTLMv1 prevention. Each area has its own tab above.
+  membership, Protected Users coverage, password policy, per-account and per-computer security checks (Users and
+  Computers tabs, each with a severity and recommendation), and the Group Policy settings that enforce (or fail
+  to enforce) key protections such as SMB signing and NTLMv1 prevention. Each area has its own tab above, and
+  every check also writes a CSV under the evidence folder.
   <br /><br />
   Privileged group membership is a snapshot resolved recursively through nested groups; hover over an amber
   checkmark to see the nesting path, and over an underlined group name to see its resolved membership (capped at
@@ -3112,6 +4106,61 @@ function renderPrivileged() {
   container.innerHTML = html;
 }
 
+function sevBadge(sev) {
+  const s = (sev || 'Info');
+  return '<span class="sev sev-' + esc(s.toLowerCase()) + '">' + esc(s) + '</span>';
+}
+
+function renderCheckTable(check) {
+  if (!check.rows || check.rows.length === 0) {
+    return '<p class="muted">No matching objects found.</p>';
+  }
+  const head = check.columns.map(c => '<th>' + esc(c.label) + '</th>').join('');
+  const body = check.rows.map(r =>
+    '<tr>' + check.columns.map(c => '<td>' + esc(r[c.key]) + '</td>').join('') + '</tr>'
+  ).join('');
+  let t = '<div class="table-wrap"><table class="data-table"><thead><tr>' + head + '</tr></thead><tbody>' + body + '</tbody></table></div>';
+  if (check.truncated) {
+    t += '<p class="muted">Showing the first ' + check.displayedCount + ' of ' + check.count + ' rows; see CSV\\' + esc(check.csv) + ' for the full list.</p>';
+  }
+  return t;
+}
+
+function renderAccountChecks(category, containerId, intro) {
+  const container = document.getElementById(containerId);
+  const checks = (data.accountChecks || []).filter(c => c.category === category);
+
+  if (checks.length === 0) {
+    container.innerHTML = '<p class="muted">No checks were collected for this category.</p>';
+    return;
+  }
+
+  let html = intro ? '<p class="tab-intro">' + esc(intro) + '</p>' : '';
+
+  html += '<div class="check-overview">' + checks.map(c => {
+    const cls = c.count > 0 ? 'sev-' + esc(c.severity.toLowerCase()) : 'sev-none';
+    return '<a class="check-card ' + cls + '" href="#check-' + esc(c.key) + '" data-check="' + esc(c.key) + '">' +
+      '<div class="check-card-value">' + c.count + '</div>' +
+      '<div class="check-card-title">' + esc(c.title) + '</div>' +
+      sevBadge(c.severity) + '</a>';
+  }).join('') + '</div>';
+
+  checks.forEach(c => {
+    html += '<details class="check-block" id="check-' + esc(c.key) + '">' +
+      '<summary><span class="check-name">' + esc(c.title) + '</span>' + sevBadge(c.severity) +
+      '<span class="check-count muted">' + c.count + ' found</span></summary>' +
+      '<div class="check-body">' +
+      '<p class="check-desc">' + esc(c.description) + '</p>' +
+      (c.note ? '<p class="muted">' + esc(c.note) + '</p>' : '') +
+      '<div class="reco"><strong>Recommendation:</strong> ' + esc(c.recommendation) + '</div>' +
+      renderCheckTable(c) +
+      '<p class="muted">Evidence: <code>CSV\\' + esc(c.csv) + '</code></p>' +
+      '</div></details>';
+  });
+
+  container.innerHTML = html;
+}
+
 function policyValueDays(v) {
   if (v === 0 || v >= 10000) return 'Not set / never';
   return v + ' days';
@@ -3241,8 +4290,22 @@ document.body.addEventListener('mouseout', e => {
   tooltip.style.display = 'none';
 });
 
+// Clicking a quick-overview card opens and scrolls to its detail section.
+document.body.addEventListener('click', e => {
+  const card = e.target.closest('.check-card');
+  if (!card) return;
+  e.preventDefault();
+  const detail = document.getElementById('check-' + card.dataset.check);
+  if (detail) {
+    detail.open = true;
+    detail.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
 renderSummary();
 renderOverview();
+renderAccountChecks('Users', 'users-container', 'User-account security checks. Each card is a check; click it to jump to the details, evidence table and recommendation. Full results are written to one CSV per check.');
+renderAccountChecks('Computers', 'computers-container', 'Computer-account security checks. Each card is a check; click it to jump to the details, evidence table and recommendation. Full results are written to one CSV per check.');
 renderPolicies('', 'all');
 renderScope('', false);
 renderPrivileged();
@@ -3412,6 +4475,7 @@ renderPasswordPolicy();
     $SummaryLines.Add("CSV\Privileged-Group-Members.csv")
     $SummaryLines.Add("CSV\Privileged-Group-Nested-Groups.csv")
     $SummaryLines.Add("CSV\Privileged-Account-Membership-Matrix.csv")
+    $SummaryLines.Add("CSV\Check-*.csv (one file per Users/Computers security check)")
     $SummaryLines.Add("GPO-Reports-HTML\")
     $SummaryLines.Add("GPO-Reports-XML\")
     $SummaryLines.Add("Raw-GptTmpl-INF\")

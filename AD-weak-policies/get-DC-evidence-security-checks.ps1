@@ -953,6 +953,9 @@ function New-AccountCheck {
         [Parameter(Mandatory)]
         [string]$Recommendation,
 
+        [Parameter()]
+        [string]$Risk = "",
+
         [Parameter(Mandatory)]
         [object[]]$Columns,
 
@@ -1000,6 +1003,7 @@ function New-AccountCheck {
         category       = $Category
         severity       = $Severity
         description    = $Description
+        risk           = $Risk
         recommendation = $Recommendation
         columns        = $Columns
         count          = $RowArray.Count
@@ -3014,165 +3018,192 @@ try {
     # ---- Users tab ----
 
     $AccountChecks.Add((New-AccountCheck -Key "user-unconstrained" -Title "Unconstrained delegation (users)" -Category "Users" -Severity "Critical" `
-        -Description "User accounts trusted for unconstrained delegation. If compromised, an attacker can impersonate any user that authenticates to them, including domain admins." `
-        -Recommendation "Remove unconstrained delegation from user accounts. Where delegation is required, use constrained delegation or resource-based constrained delegation, and add sensitive accounts to Protected Users." `
+        -Description "These user accounts are set to 'trust this account for delegation to any service' (unconstrained delegation). That means the account is allowed to receive and reuse the Kerberos credentials of anyone who authenticates to it, and act as that person against any service in the domain. On a user account this is almost never needed and is usually a misconfiguration." `
+        -Risk "If one of these accounts is compromised, an attacker can collect the Kerberos tickets of every user that has authenticated to it - including Domain Admins - and replay them to impersonate those users anywhere. This is one of the fastest routes from a single account to full domain compromise." `
+        -Recommendation "Remove unconstrained delegation from user accounts. If delegation is genuinely required, switch to constrained or resource-based constrained delegation limited to specific services, and add sensitive or privileged accounts to the Protected Users group so they can never be delegated." `
         -Columns @($ColName, $ColSam, $ColEnabled) -Rows $UserUnconstrainedRows.ToArray() `
         -CsvDirectory $CsvDir -CsvName "Check-Users-Unconstrained-Delegation.csv" -MaxDisplay $MaxAccountRowsToDisplay))
 
     $AccountChecks.Add((New-AccountCheck -Key "service-accounts" -Title "Service accounts (SPN)" -Category "Users" -Severity "High" `
-        -Description "Accounts with a Service Principal Name, flagged for password-never-expires, password age and privileged group membership." `
-        -Recommendation "Prefer group-managed service accounts (gMSA). Ensure long (25+ character) random passwords, AES encryption, least privilege, and remove privileged group membership where not required." `
+        -Description "These user accounts carry a Service Principal Name (SPN), which means an application or service (SQL Server, IIS, a scheduled task, etc.) logs in as them using Kerberos. This list shows each service account together with whether its password never expires, how old the password is, and whether it belongs to a privileged group - the three things that make a service account risky." `
+        -Risk "Service accounts commonly have old, weak, human-chosen passwords and more privileges than they need. They are the prime target for Kerberoasting (see below), and a privileged service account that is cracked gives an attacker broad, persistent access." `
+        -Recommendation "Prefer group Managed Service Accounts (gMSA), which automatically use and rotate a long random password. Where that is not possible, give the account a long (25+ character) random password, enable AES encryption, grant it only the rights it actually needs, and remove it from privileged groups." `
         -Columns @($ColName, $ColSam, $ColEnabled, $ColPls, [PSCustomObject]@{ key = "passwordAgeDays"; label = "Password age (days)" }, [PSCustomObject]@{ key = "passwordNeverExpires"; label = "Never expires" }, [PSCustomObject]@{ key = "privileged"; label = "Privileged" }, [PSCustomObject]@{ key = "spnCount"; label = "SPN count" }) `
         -Rows $ServiceAccountRows.ToArray() -CsvDirectory $CsvDir -CsvName "Check-Service-Accounts.csv" -MaxDisplay $MaxAccountRowsToDisplay))
 
     $AccountChecks.Add((New-AccountCheck -Key "kerberoastable" -Title "Kerberoastable accounts (SPN)" -Category "Users" -Severity "High" `
-        -Description "User accounts with a Service Principal Name. Any authenticated user can request their service tickets, which are encrypted with the account's password hash and can be cracked offline." `
-        -Recommendation "Use gMSA where possible; otherwise enforce long random passwords and AES-only encryption, and remove unnecessary SPNs." `
+        -Description "Any user account that has a Service Principal Name can have a Kerberos service ticket requested for it by any authenticated user in the domain. That ticket is encrypted with the account's own password, so an attacker can capture it and try to crack the password offline. This attack is called Kerberoasting." `
+        -Risk "An attacker who has compromised just one ordinary domain account can request these tickets and crack weak passwords offline at their own pace - with no account lockout and nothing that looks like a failed login - then sign in directly as the service account." `
+        -Recommendation "Use gMSA where you can. Otherwise enforce long random passwords (25+ characters) and AES-only encryption so offline cracking is impractical, and remove SPNs that are no longer used so the account is no longer roastable." `
         -Columns @($ColName, $ColSam, $ColEnabled, $ColPls, [PSCustomObject]@{ key = "spn"; label = "ServicePrincipalName" }) `
         -Rows $KerberoastRows.ToArray() -CsvDirectory $CsvDir -CsvName "Check-Kerberoastable-Accounts.csv" -MaxDisplay $MaxAccountRowsToDisplay))
 
     $AccountChecks.Add((New-AccountCheck -Key "asrep-roastable" -Title "AS-REP roastable accounts" -Category "Users" -Severity "High" `
-        -Description "Accounts configured with 'Do not require Kerberos preauthentication'. An attacker can request an AS-REP and crack it offline without any credentials." `
-        -Recommendation "Enable Kerberos preauthentication on these accounts unless a documented legacy requirement exists." `
+        -Description "These accounts have 'Do not require Kerberos pre-authentication' turned on. Pre-authentication is the step that normally stops someone from requesting authentication material for an account they do not control." `
+        -Risk "With pre-authentication disabled, anyone - even with no credentials at all - can ask a domain controller for encrypted data tied to the account and crack its password offline. This is called AS-REP Roasting." `
+        -Recommendation "Re-enable Kerberos pre-authentication on these accounts unless a specific, documented legacy application requires it. If it must stay disabled, make sure the account has a very strong, long password." `
         -Columns @($ColName, $ColSam, $ColEnabled) -Rows $AsrepRows.ToArray() `
         -CsvDirectory $CsvDir -CsvName "Check-ASREP-Roastable-Accounts.csv" -MaxDisplay $MaxAccountRowsToDisplay))
 
     $AccountChecks.Add((New-AccountCheck -Key "privileged-accounts" -Title "Privileged accounts" -Category "Users" -Severity "High" `
-        -Description "Members (direct or nested) of the core administrative groups: Domain Admins, Enterprise Admins, Schema Admins, Administrators, Account Operators, Server Operators and Backup Operators." `
-        -Recommendation "Keep these groups as small as possible, use dedicated admin accounts, add them to Protected Users, and review membership regularly." `
+        -Description "These are the members (directly, or through a nested group) of the domain's most powerful groups: Domain Admins, Enterprise Admins, Schema Admins, Administrators, Account Operators, Server Operators and Backup Operators. Between them these groups can effectively control the entire domain." `
+        -Risk "Every extra member of these groups is another account that, if phished or cracked, hands an attacker control of the environment. Oversized or stale membership dramatically increases the blast radius of a single compromise." `
+        -Recommendation "Keep these groups as small as possible. Use separate, dedicated admin accounts (never day-to-day accounts) for privileged work, add them to Protected Users, require multi-factor authentication and secure admin workstations, and review the membership on a regular schedule." `
         -Columns @($ColName, $ColSam, $ColType, [PSCustomObject]@{ key = "memberOf"; label = "Member of" }) `
         -Rows $PrivilegedAccountRows -CsvDirectory $CsvDir -CsvName "Check-Privileged-Accounts.csv" -MaxDisplay $MaxAccountRowsToDisplay))
 
     $AccountChecks.Add((New-AccountCheck -Key "user-sidhistory" -Title "Accounts with SIDHistory" -Category "Users" -Severity "High" `
-        -Description "User accounts that carry a SIDHistory attribute. SIDHistory can grant hidden, inherited access and is a known persistence and privilege-escalation technique." `
-        -Recommendation "Review why SIDHistory is present. Remove it after migrations are complete unless there is a documented need." `
+        -Description "SIDHistory lets an account carry the security identifiers (SIDs) of other accounts - usually a leftover from a domain migration. Windows treats those extra SIDs as if the account still were those old identities, so the account effectively inherits their access." `
+        -Risk "SIDHistory can silently grant access, including administrative access, that does not show up in normal group membership - so it is easy to miss during a review. Attackers deliberately inject privileged SIDs here as a stealthy way to keep access and escalate privilege." `
+        -Recommendation "Review why each account has SIDHistory. Once a migration is complete, clear the attribute. Investigate any SIDHistory you cannot explain, especially values that correspond to privileged groups." `
         -Columns @($ColName, $ColSam, $ColEnabled, [PSCustomObject]@{ key = "sidHistory"; label = "SIDHistory" }) `
         -Rows $UserSidHistoryRows.ToArray() -CsvDirectory $CsvDir -CsvName "Check-Users-SIDHistory.csv" -MaxDisplay $MaxAccountRowsToDisplay))
 
     $AccountChecks.Add((New-AccountCheck -Key "user-des" -Title "DES encryption allowed (users)" -Category "Users" -Severity "High" `
-        -Description "Accounts that allow DES Kerberos encryption (via msDS-SupportedEncryptionTypes DES bits or UseDESKeyOnly). DES is cryptographically broken." `
-        -Recommendation "Remove DES support and configure AES-only encryption on these accounts." `
+        -Description "These accounts still allow the old DES Kerberos encryption types (or have the 'use DES keys only' flag set). DES is a decades-old algorithm that modern Windows disables by default." `
+        -Risk "DES keys can be broken very quickly with today's hardware, so any Kerberos ticket protected with DES can be decrypted and the account's credentials recovered." `
+        -Recommendation "Remove DES support from these accounts and configure them for AES (AES128 and AES256) only. Clear the 'use DES keys only' flag wherever it is set." `
         -Columns @($ColName, $ColSam, $ColEnabled, $ColEnc) -Rows $UserDesRows.ToArray() `
         -CsvDirectory $CsvDir -CsvName "Check-Users-DES-Allowed.csv" -MaxDisplay $MaxAccountRowsToDisplay))
 
     $AccountChecks.Add((New-AccountCheck -Key "user-constrained" -Title "Constrained delegation (users)" -Category "Users" -Severity "High" `
-        -Description "User accounts with msDS-AllowedToDelegateTo set. These can impersonate users to the listed services (and to any service on the same host when protocol transition is enabled)." `
-        -Recommendation "Confirm each delegation is still required and least-privilege. Prefer resource-based constrained delegation, and protect sensitive target services." `
+        -Description "These user accounts are configured to delegate - that is, to impersonate users - to a specific list of services (the msDS-AllowedToDelegateTo attribute). When 'protocol transition' is also enabled, the account can do this even for users who never actually authenticated to it." `
+        -Risk "Delegation lets the account act as other users against the listed services. If the account is compromised, or if a target service is sensitive, this becomes a lateral-movement or privilege-escalation path - and protocol transition makes it easier to abuse." `
+        -Recommendation "Confirm each delegation is still needed and scoped to the fewest services possible. Prefer resource-based constrained delegation (managed on the target service), avoid protocol transition unless it is required, and protect high-value target services." `
         -Columns @($ColName, $ColSam, $ColEnabled, [PSCustomObject]@{ key = "protocolTransition"; label = "Protocol transition" }, [PSCustomObject]@{ key = "allowedToDelegateTo"; label = "Allowed to delegate to" }) `
         -Rows $UserConstrainedRows.ToArray() -CsvDirectory $CsvDir -CsvName "Check-Users-Constrained-Delegation.csv" -MaxDisplay $MaxAccountRowsToDisplay))
 
     $AccountChecks.Add((New-AccountCheck -Key "user-no-aes" -Title "Accounts without AES (users)" -Category "Users" -Severity "Medium" `
-        -Description "Accounts whose msDS-SupportedEncryptionTypes is configured but does not include AES128 or AES256 (RC4/DES only)." `
-        -Recommendation "Configure AES128 and AES256 support; remove RC4/DES where compatibility allows." `
+        -Description "These accounts have an encryption-types value configured, but it does not include AES128 or AES256 - so they fall back to the older RC4 (or DES) for Kerberos." `
+        -Risk "RC4-protected Kerberos tickets are far easier to crack offline than AES (this is exactly what makes Kerberoasting practical), and Microsoft is phasing RC4 out. Leaving it in use keeps weak cryptography on these accounts." `
+        -Recommendation "Enable AES128 and AES256 on these accounts. Remove RC4 and DES once you have confirmed nothing depends on them, testing first where legacy systems are involved." `
         -Columns @($ColName, $ColSam, $ColEnabled, $ColEnc) -Rows $UserNoAesRows.ToArray() `
         -CsvDirectory $CsvDir -CsvName "Check-Users-No-AES.csv" -MaxDisplay $MaxAccountRowsToDisplay))
 
     $AccountChecks.Add((New-AccountCheck -Key "admincount" -Title "Protected accounts (AdminCount = 1)" -Category "Users" -Severity "Medium" `
-        -Description "Accounts with AdminCount = 1. These are (or were) protected by AdminSDHolder. A set AdminCount on a non-privileged account can indicate stale or leftover privileged access." `
-        -Recommendation "Verify each account still requires privileged access. For former admins, clear AdminCount and restore inheritance after removing them from privileged groups." `
+        -Description "AdminCount is set to 1 on accounts that are, or once were, members of a protected/privileged group. A background process (AdminSDHolder) stamps this value and locks down the account's permissions. The value often lingers long after the account has been removed from those groups." `
+        -Risk "An AdminCount of 1 on an account that is no longer an admin usually means leftover hardened permissions and broken inheritance - and it can hide the fact that an account once had, or still quietly has, privileged access that a normal group review would miss." `
+        -Recommendation "Check whether each account still needs privileged access. For former admins, remove them from the privileged groups, clear the AdminCount value, and re-enable permission inheritance on the account object." `
         -Columns @($ColName, $ColSam, $ColEnabled, [PSCustomObject]@{ key = "adminCount"; label = "AdminCount" }) `
         -Rows $AdminCountRows.ToArray() -CsvDirectory $CsvDir -CsvName "Check-AdminCount-Accounts.csv" -MaxDisplay $MaxAccountRowsToDisplay))
 
     $AccountChecks.Add((New-AccountCheck -Key "password-never-expires" -Title "Password never expires" -Category "Users" -Severity "Medium" `
-        -Description "Accounts with PasswordNeverExpires = True. Their passwords are never forced to change." `
-        -Recommendation "Remove the flag where possible. For service accounts that require it, use gMSA or enforce long random passwords with a rotation process." `
+        -Description "These accounts have the 'password never expires' flag set, so their password is never forced to change, regardless of the domain password policy." `
+        -Risk "A password that never changes has an unlimited window in which to be guessed, cracked, or reused after a data breach. This is especially dangerous on service accounts and admin accounts." `
+        -Recommendation "Remove the flag wherever you can. For service accounts that genuinely need a stable password, move them to gMSA, or set a very long random password and rotate it on a defined schedule." `
         -Columns @($ColName, $ColSam, $ColEnabled, $ColPls) -Rows $PwdNeverExpiresRows.ToArray() `
         -CsvDirectory $CsvDir -CsvName "Check-Password-Never-Expires.csv" -MaxDisplay $MaxAccountRowsToDisplay))
 
     $AccountChecks.Add((New-AccountCheck -Key "old-passwords" -Title "Old passwords (> $OldPasswordThresholdDays days)" -Category "Users" -Severity "Medium" `
-        -Description "Accounts whose PasswordLastSet is older than $OldPasswordThresholdDays days." `
-        -Recommendation "Investigate stale accounts and rotate or disable them. Long-lived passwords increase exposure to offline cracking." `
+        -Description "These accounts last changed their password more than $OldPasswordThresholdDays days ago. In practice this often points to forgotten service accounts or dormant user accounts that nobody manages any more." `
+        -Risk "The longer a password stays the same, the more time an attacker has to crack it offline or reuse it from an old breach. Very old passwords also frequently predate your current length and complexity requirements." `
+        -Recommendation "Investigate these accounts. Rotate the password (ideally to a long random one) or disable and later remove the account if it is no longer needed." `
         -Columns @($ColName, $ColSam, $ColEnabled, $ColPls, [PSCustomObject]@{ key = "passwordAgeDays"; label = "Password age (days)" }) `
         -Rows $OldPasswordRows.ToArray() -CsvDirectory $CsvDir -CsvName "Check-Old-Passwords.csv" -MaxDisplay $MaxAccountRowsToDisplay))
 
     $AccountChecks.Add((New-AccountCheck -Key "inactive-users" -Title "Inactive accounts (> $InactiveAccountThresholdDays days)" -Category "Users" -Severity "Medium" `
-        -Description "Enabled accounts whose LastLogonDate is older than $InactiveAccountThresholdDays days." `
-        -Recommendation "Disable or remove accounts that are no longer used. Stale enabled accounts widen the attack surface." `
+        -Description "These user accounts are still enabled but have not signed in for more than $InactiveAccountThresholdDays days, based on their last-logon timestamp. They are usually accounts for people who have left or roles that no longer exist." `
+        -Risk "Unused-but-enabled accounts are an easy, quiet target: an attacker can take one over and nobody notices, because no real user is watching it and its misuse will not look out of place." `
+        -Recommendation "Confirm the account is genuinely unused, then disable it (a safe, reversible step) and delete it later once you are sure it is not needed." `
         -Columns @($ColName, $ColSam, $ColEnabled, $ColLastLog) -Rows $InactiveUserRows.ToArray() `
         -CsvDirectory $CsvDir -CsvName "Check-Inactive-Users.csv" -MaxDisplay $MaxAccountRowsToDisplay))
 
     $AccountChecks.Add((New-AccountCheck -Key "sensitive-not-delegated" -Title "Sensitive - cannot be delegated" -Category "Users" -Severity "Info" `
-        -Description "Accounts flagged 'Account is sensitive and cannot be delegated' (NOT_DELEGATED). This is a hardening control; the list is provided for verification of coverage." `
-        -Recommendation "Ensure all highly privileged accounts carry this flag (or are in Protected Users) so they cannot be delegated." `
+        -Description "These accounts have the 'Account is sensitive and cannot be delegated' flag, which stops other services from impersonating them through Kerberos delegation. This is a good, protective setting - the list is here so you can confirm your important accounts are covered." `
+        -Risk "The concern is what is missing: any highly privileged account that is NOT on this list (and not in the Protected Users group) can be impersonated through delegation if a delegating server is compromised." `
+        -Recommendation "Make sure every highly privileged account either carries this flag or is a member of the Protected Users group, so it can never be delegated." `
         -Columns @($ColName, $ColSam, $ColEnabled) -Rows $SensitiveRows.ToArray() `
         -CsvDirectory $CsvDir -CsvName "Check-Sensitive-Cannot-Be-Delegated.csv" -MaxDisplay $MaxAccountRowsToDisplay))
 
     $AccountChecks.Add((New-AccountCheck -Key "protected-users" -Title "Protected Users members" -Category "Users" -Severity "Info" `
-        -Description "Members of the Protected Users group. Membership hardens accounts (no NTLM, no delegation, no RC4/DES), but breaks accounts that depend on those. Also shown on the Privileged access tab." `
-        -Recommendation "Add highly privileged interactive accounts to Protected Users after confirming they do not rely on unsupported authentication." `
+        -Description "These are the members of the Protected Users group. Membership automatically hardens an account: it can no longer use NTLM, cannot be delegated, cannot use weak (RC4/DES) Kerberos, and its credentials are not cached for long. This same list also appears on the Privileged access tab." `
+        -Risk "The concern is coverage: privileged accounts that are NOT in this group miss those protections. Note the trade-off - adding an account here can break sign-ins that still rely on NTLM or older protocols, so test before adding." `
+        -Recommendation "Add your highly privileged, interactive admin accounts to Protected Users after confirming they do not depend on NTLM or legacy authentication. Do not add service accounts or computer accounts without testing them first." `
         -Columns @($ColName, $ColSam, $ColType, [PSCustomObject]@{ key = "via"; label = "Via" }) `
         -Rows $ProtectedUserRows.ToArray() -CsvDirectory $CsvDir -CsvName "Check-Protected-Users.csv" -MaxDisplay $MaxAccountRowsToDisplay -Note $ProtectedUsersNote))
 
     $AccountChecks.Add((New-AccountCheck -Key "disabled-users" -Title "Disabled accounts" -Category "Users" -Severity "Low" `
-        -Description "User accounts that are disabled (Enabled = False)." `
-        -Recommendation "Remove disabled accounts that are no longer needed to keep the directory clean and reduce the attack surface." `
+        -Description "These user accounts are currently disabled: they cannot log in, but the account objects - along with any group memberships and permissions - still exist in the directory." `
+        -Risk "Disabled accounts are low risk while they stay disabled, but they clutter the directory and could be re-enabled by an attacker to gain a foothold that looks legitimate, sometimes with old privileges still attached." `
+        -Recommendation "Review and remove disabled accounts that are no longer needed. Keep any that are intentionally retained (for example for mailbox access) documented so they are not mistaken for a problem." `
         -Columns @($ColName, $ColSam, $ColLastLog) -Rows $DisabledUserRows.ToArray() `
         -CsvDirectory $CsvDir -CsvName "Check-Disabled-Users.csv" -MaxDisplay $MaxAccountRowsToDisplay))
 
     # ---- Computers tab ----
 
     $AccountChecks.Add((New-AccountCheck -Key "computer-unconstrained" -Title "Unconstrained delegation (computers)" -Category "Computers" -Severity "Critical" `
-        -Description "Computers trusted for unconstrained delegation. If compromised, an attacker can capture and reuse the TGTs of any user that connects, including domain admins. Domain controllers hold this legitimately and are flagged as such." `
-        -Recommendation "Remove unconstrained delegation from member servers. Use constrained or resource-based constrained delegation, and add sensitive accounts to Protected Users." `
+        -Description "A computer set for unconstrained delegation stores the full Kerberos ticket (the TGT) of every user who connects to it, and is allowed to reuse those tickets to impersonate them anywhere. Domain controllers have this legitimately; ordinary member servers almost never should." `
+        -Risk "If such a server is compromised, an attacker can harvest the tickets of everyone who has connected to it - including Domain Admins - and replay them to take over the domain. It is one of the most heavily abused Active Directory misconfigurations." `
+        -Recommendation "Remove unconstrained delegation from member servers. Use constrained or resource-based constrained delegation scoped to specific services instead, and add privileged accounts to Protected Users so their tickets cannot be captured this way. Domain controllers can be left as they are." `
         -Columns @($ColName, $ColEnabled, $ColOs, [PSCustomObject]@{ key = "isDomainController"; label = "Domain controller" }) `
         -Rows $CompUnconstrainedRows.ToArray() -CsvDirectory $CsvDir -CsvName "Check-Computers-Unconstrained-Delegation.csv" -MaxDisplay $MaxAccountRowsToDisplay))
 
     $AccountChecks.Add((New-AccountCheck -Key "rbcd" -Title "Resource-based constrained delegation (RBCD)" -Category "Computers" -Severity "High" `
-        -Description "Computers with msDS-AllowedToActOnBehalfOfOtherIdentity set. Other principals are allowed to impersonate users to this computer; a writable value is a common lateral-movement and privilege-escalation vector." `
-        -Recommendation "Review the configured principals on each object and remove entries that are not required. Restrict who can write this attribute." `
+        -Description "These computers have the msDS-AllowedToActOnBehalfOfOtherIdentity attribute set, which lists other principals that are allowed to impersonate users to this machine. Unlike classic delegation, this is configured on the target computer itself." `
+        -Risk "If an attacker can write this attribute - for example after taking over a computer object or gaining the right permissions - they can grant themselves the ability to impersonate any user, including admins, to that host. It is a common lateral-movement and privilege-escalation technique." `
+        -Recommendation "Review which principals are listed on each object and remove any that are not required. Tighten who is allowed to write computer attributes, and watch for unexpected changes to this setting." `
         -Columns @($ColName, $ColEnabled, [PSCustomObject]@{ key = "note"; label = "Detail" }) `
         -Rows $RbcdRows.ToArray() -CsvDirectory $CsvDir -CsvName "Check-Computers-RBCD.csv" -MaxDisplay $MaxAccountRowsToDisplay))
 
     $AccountChecks.Add((New-AccountCheck -Key "computer-constrained" -Title "Constrained delegation (computers)" -Category "Computers" -Severity "High" `
-        -Description "Computers with msDS-AllowedToDelegateTo set. These can impersonate users to the listed services (and to any service on the same host when protocol transition is enabled)." `
-        -Recommendation "Confirm each delegation is still required and least-privilege. Prefer resource-based constrained delegation and protect sensitive target services." `
+        -Description "These computers can delegate - impersonate users - to a specific list of services (the msDS-AllowedToDelegateTo attribute). With 'protocol transition' enabled, they can do this even when the user did not authenticate to them directly." `
+        -Risk "A compromised server with constrained delegation can act as other users against the listed services; if those targets are sensitive, that is a direct escalation path. Protocol transition makes it easier still to abuse." `
+        -Recommendation "Confirm each delegation is still required and scoped to as few services as possible. Prefer resource-based constrained delegation, avoid protocol transition unless it is needed, and protect the target services." `
         -Columns @($ColName, $ColEnabled, [PSCustomObject]@{ key = "protocolTransition"; label = "Protocol transition" }, [PSCustomObject]@{ key = "allowedToDelegateTo"; label = "Allowed to delegate to" }) `
         -Rows $CompConstrainedRows.ToArray() -CsvDirectory $CsvDir -CsvName "Check-Computers-Constrained-Delegation.csv" -MaxDisplay $MaxAccountRowsToDisplay))
 
     $AccountChecks.Add((New-AccountCheck -Key "delegation-overview" -Title "Kerberos delegation overview (users & computers)" -Category "Computers" -Severity "High" `
-        -Description "Combined view of every object configured for Kerberos delegation: unconstrained, constrained (with or without protocol transition) and resource-based constrained delegation." `
-        -Recommendation "Treat delegation as high-value configuration. Remove unconstrained delegation, minimise constrained/RBCD scope, and monitor changes to these attributes." `
+        -Description "A single, combined list of every account - user or computer - that is configured for any form of Kerberos delegation: unconstrained, constrained (with or without protocol transition), and resource-based. Delegation is powerful and easy to get wrong, so this brings the whole picture together in one place." `
+        -Risk "Delegation lets one account act as others. Taken together, these are some of the highest-value targets in the domain: a single compromised delegating account can lead to a full domain takeover." `
+        -Recommendation "Eliminate unconstrained delegation, keep constrained and resource-based delegation scoped to the minimum, review this list regularly, and alert on changes to delegation attributes. Add sensitive accounts to Protected Users." `
         -Columns @([PSCustomObject]@{ key = "object"; label = "Object" }, [PSCustomObject]@{ key = "type"; label = "Type" }, [PSCustomObject]@{ key = "sam"; label = "SamAccountName" }, [PSCustomObject]@{ key = "delegationType"; label = "Delegation type" }, [PSCustomObject]@{ key = "details"; label = "Details" }) `
         -Rows $DelegationOverviewRows.ToArray() -CsvDirectory $CsvDir -CsvName "Check-Kerberos-Delegation-Overview.csv" -MaxDisplay $MaxAccountRowsToDisplay))
 
     $AccountChecks.Add((New-AccountCheck -Key "computer-des" -Title "DES encryption allowed (computers)" -Category "Computers" -Severity "High" `
-        -Description "Computers that allow DES Kerberos encryption (via msDS-SupportedEncryptionTypes DES bits or UseDESKeyOnly). DES is cryptographically broken." `
-        -Recommendation "Remove DES support and configure AES-only encryption." `
+        -Description "These computers still allow the old DES Kerberos encryption types (or have the 'use DES keys only' flag set). DES is obsolete and disabled by default on current versions of Windows." `
+        -Risk "DES keys are trivially broken with modern hardware, so any Kerberos traffic protected with DES can be decrypted and the machine's credentials recovered." `
+        -Recommendation "Remove DES support and configure AES (AES128 and AES256) only. Clear the 'use DES keys only' flag where it is set, testing legacy systems first." `
         -Columns @($ColName, $ColEnabled, $ColEnc) -Rows $CompDesRows.ToArray() `
         -CsvDirectory $CsvDir -CsvName "Check-Computers-DES-Allowed.csv" -MaxDisplay $MaxAccountRowsToDisplay))
 
     $AccountChecks.Add((New-AccountCheck -Key "computer-sidhistory" -Title "Computers with SIDHistory" -Category "Computers" -Severity "High" `
-        -Description "Computer accounts that carry a SIDHistory attribute, which can grant hidden inherited access and is a known persistence technique." `
-        -Recommendation "Review why SIDHistory is present and remove it once migrations are complete unless documented as required." `
+        -Description "These computer accounts carry a SIDHistory attribute, normally a leftover from a domain migration. Windows honours those extra SIDs as if the computer still were those old identities." `
+        -Risk "SIDHistory can grant hidden, inherited access that does not appear in normal group membership, and is used by attackers as a stealthy way to keep access to the environment." `
+        -Recommendation "Review why each computer has SIDHistory and clear it once migrations are complete. Investigate any values you cannot account for." `
         -Columns @($ColName, $ColEnabled, [PSCustomObject]@{ key = "sidHistory"; label = "SIDHistory" }) `
         -Rows $CompSidHistoryRows.ToArray() -CsvDirectory $CsvDir -CsvName "Check-Computers-SIDHistory.csv" -MaxDisplay $MaxAccountRowsToDisplay))
 
     $AccountChecks.Add((New-AccountCheck -Key "laps-missing" -Title "Computers without LAPS" -Category "Computers" -Severity "High" `
-        -Description "Enabled, non-domain-controller computers that have no LAPS password-expiration attribute set, meaning the local administrator password is likely not managed by LAPS." `
-        -Recommendation "Deploy LAPS (Windows LAPS or legacy) to all member computers so local administrator passwords are unique and rotated." `
+        -Description "These are enabled member computers (domain controllers excluded) that have no LAPS password-expiration attribute, which strongly suggests their local Administrator password is not managed by LAPS. LAPS gives every machine a unique local admin password and rotates it automatically." `
+        -Risk "Without LAPS, organisations usually reuse the same local administrator password across many machines. An attacker who recovers that password from one computer can then log in to all of them - the classic 'pass-the-hash' spread across an entire fleet." `
+        -Recommendation "Deploy LAPS (Windows LAPS or the legacy version) to all member computers so each has its own unique, automatically rotated local administrator password, and restrict who is allowed to read those passwords." `
         -Columns @($ColName, $ColOs, $ColEnabled) -Rows $LapsMissingRows.ToArray() `
         -CsvDirectory $CsvDir -CsvName "Check-Computers-Without-LAPS.csv" -MaxDisplay $MaxAccountRowsToDisplay -Note $LapsNote))
 
     $AccountChecks.Add((New-AccountCheck -Key "computer-no-aes" -Title "Computers without AES" -Category "Computers" -Severity "Medium" `
-        -Description "Computers whose msDS-SupportedEncryptionTypes is configured but does not include AES128 or AES256 (RC4/DES only)." `
-        -Recommendation "Configure AES128 and AES256 support; remove RC4/DES where compatibility allows." `
+        -Description "These computers have an encryption-types value configured that does not include AES128 or AES256, so they fall back to the older RC4 (or DES) for Kerberos." `
+        -Risk "RC4 is weaker and easier to attack offline than AES, and Microsoft is phasing it out. Keeping it enabled prolongs the use of outdated cryptography on these machines." `
+        -Recommendation "Enable AES128 and AES256 on these computers and remove RC4 and DES once you have confirmed nothing depends on them." `
         -Columns @($ColName, $ColEnabled, $ColEnc) -Rows $CompNoAesRows.ToArray() `
         -CsvDirectory $CsvDir -CsvName "Check-Computers-No-AES.csv" -MaxDisplay $MaxAccountRowsToDisplay))
 
     $AccountChecks.Add((New-AccountCheck -Key "domain-controllers" -Title "Domain controllers" -Category "Computers" -Severity $DomainControllerSeverity `
-        -Description "Domain controller inventory with operating-system support status and FSMO role placement. Last-reboot time is not available through the ActiveDirectory module and is not shown here." `
-        -Recommendation "Upgrade domain controllers running legacy/end-of-life operating systems and keep them patched. Verify FSMO placement matches your design." `
+        -Description "An inventory of the domain controllers with their operating-system version, support status and FSMO role placement. Domain controllers are the most sensitive servers you have, so their patch level and configuration matter most. Last-reboot time cannot be read from Active Directory alone and is not shown here." `
+        -Risk "A domain controller running an end-of-life operating system no longer receives security fixes, which leaves known, unpatched vulnerabilities on the single most critical set of systems in the environment." `
+        -Recommendation "Upgrade any domain controllers on legacy or end-of-life operating systems and keep them fully patched. Confirm the FSMO roles are placed where your design expects them to be." `
         -Columns @([PSCustomObject]@{ key = "host"; label = "Host" }, $ColOs, [PSCustomObject]@{ key = "osVersion"; label = "OS version" }, [PSCustomObject]@{ key = "osSupport"; label = "OS support" }, [PSCustomObject]@{ key = "fsmoRoles"; label = "FSMO roles" }, [PSCustomObject]@{ key = "globalCatalog"; label = "GC" }, [PSCustomObject]@{ key = "readOnly"; label = "RODC" }) `
         -Rows $DomainControllerRows.ToArray() -CsvDirectory $CsvDir -CsvName "Check-Domain-Controllers.csv" -MaxDisplay $MaxAccountRowsToDisplay))
 
     $AccountChecks.Add((New-AccountCheck -Key "inactive-computers" -Title "Inactive computers (> $InactiveAccountThresholdDays days)" -Category "Computers" -Severity "Medium" `
-        -Description "Enabled computer accounts whose LastLogonDate is older than $InactiveAccountThresholdDays days." `
-        -Recommendation "Disable or remove stale computer accounts. Orphaned computer objects can be abused and clutter the directory." `
+        -Description "These computer accounts are still enabled but have not authenticated for more than $InactiveAccountThresholdDays days - typically decommissioned machines whose accounts were never cleaned up." `
+        -Risk "Stale computer objects can be taken over or re-joined by an attacker to blend in with legitimate systems, and they clutter the directory, making genuine problems harder to spot." `
+        -Recommendation "Confirm the machine is really gone, then disable the computer account (a reversible step) and delete it once you are sure." `
         -Columns @($ColName, $ColOs, $ColLastLog) -Rows $InactiveComputerRows.ToArray() `
         -CsvDirectory $CsvDir -CsvName "Check-Inactive-Computers.csv" -MaxDisplay $MaxAccountRowsToDisplay))
 
     $AccountChecks.Add((New-AccountCheck -Key "disabled-computers" -Title "Disabled computers" -Category "Computers" -Severity "Low" `
-        -Description "Computer accounts that are disabled (Enabled = False)." `
+        -Description "These computer accounts are currently disabled: they cannot authenticate, but the account objects still exist in the directory." `
+        -Risk "Low risk while they remain disabled, but they add clutter and could be re-enabled to provide a legitimate-looking foothold." `
         -Recommendation "Remove disabled computer accounts that are no longer needed." `
         -Columns @($ColName, $ColOs, $ColLastLog) -Rows $DisabledComputerRows.ToArray() `
         -CsvDirectory $CsvDir -CsvName "Check-Disabled-Computers.csv" -MaxDisplay $MaxAccountRowsToDisplay))
@@ -3693,7 +3724,8 @@ footer { padding: 20px 32px 40px; color: var(--muted); font-size: 12px; border-t
 .check-count { margin-left: auto; }
 .check-body { padding: 0 18px 18px; }
 .check-desc { font-size: 13px; margin: 0 0 10px; }
-.reco { font-size: 13px; background: #f8fafc; border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin: 10px 0; }
+.risk { font-size: 13px; background: #fef2f2; border: 1px solid #fecaca; border-radius: 8px; padding: 10px 12px; margin: 10px 0; }
+.reco { font-size: 13px; background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 8px; padding: 10px 12px; margin: 10px 0; }
 .table-wrap { overflow-x: auto; }
 .data-table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .data-table th, .data-table td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border); vertical-align: top; word-break: break-word; }
@@ -4171,6 +4203,7 @@ function renderAccountChecks(category, containerId, intro) {
       '<div class="check-body">' +
       '<p class="check-desc">' + esc(c.description) + '</p>' +
       (c.note ? '<p class="muted">' + esc(c.note) + '</p>' : '') +
+      (c.risk ? '<div class="risk"><strong>Risk:</strong> ' + esc(c.risk) + '</div>' : '') +
       '<div class="reco"><strong>Recommendation:</strong> ' + esc(c.recommendation) + '</div>' +
       renderCheckTable(c) +
       '<p class="muted">Evidence: <code>CSV\\' + esc(c.csv) + '</code></p>' +

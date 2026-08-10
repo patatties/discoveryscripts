@@ -2463,7 +2463,7 @@ try {
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
-<title>GPO Security Audit Dashboard - __DOMAIN__</title>
+<title>Active Directory Security Report - __DOMAIN__</title>
 <style>
 :root {
   --bg: #f7f8fa;
@@ -2574,7 +2574,7 @@ footer { padding: 20px 32px 40px; color: var(--muted); font-size: 12px; border-t
 <div id="member-tooltip" class="member-tooltip"></div>
 
 <header>
-  <h1>GPO Security Audit Dashboard</h1>
+  <h1>Active Directory Security Report</h1>
   <div class="meta">Domain: <strong>__DOMAIN__</strong> &middot; Domain controller: <strong>__DC__</strong> &middot; Generated: __GENERATED_AT__</div>
 </header>
 
@@ -2582,10 +2582,10 @@ footer { padding: 20px 32px 40px; color: var(--muted); font-size: 12px; border-t
 
 <nav class="tabs">
   <button class="tab-btn active" data-tab="overview">Domain overview</button>
-  <button class="tab-btn" data-tab="policies">By GPO / policy</button>
-  <button class="tab-btn" data-tab="scope">By OU / domain</button>
   <button class="tab-btn" data-tab="privileged">Privileged access</button>
   <button class="tab-btn" data-tab="pwpolicy">Password policy</button>
+  <button class="tab-btn" data-tab="policies">Group Policy</button>
+  <button class="tab-btn" data-tab="scope">GPO scope by OU</button>
 </nav>
 
 <section id="tab-overview" class="tab-panel active">
@@ -2623,17 +2623,22 @@ footer { padding: 20px 32px 40px; color: var(--muted); font-size: 12px; border-t
 </section>
 
 <footer>
-  Structural scope shows domain/OU containers where a GPO appears in InheritedGpoLinks. This is not the same as
-  final effective (resultant) policy: security filtering, WMI filtering, loopback processing, disabled GPO
-  sections and client-side processing can still change what actually applies on an endpoint. Use
-  <code>gpresult /h</code> or <code>Get-GPResultantSetOfPolicy</code> for endpoint-specific proof. Rows marked
-  "Evaluation failed" could not be checked at all (even after retries) and are gaps in this evidence set, not
-  confirmed absence of a policy. Hover over an underlined group name to see its resolved membership (capped at
-  the configured maximum; the full list is in the CSV evidence). Privileged group membership on the
-  "Privileged access" tab is a point-in-time snapshot resolved recursively through nested groups; hover over an
-  amber checkmark to see the nesting path. Groups shown as "not resolved" could not be located (for example
-  because they do not exist at this functional level, or live in another domain of the forest) and are evidence
-  gaps rather than confirmed-empty groups.
+  This is a point-in-time enumeration of the domain: its controllers and FSMO roles, privileged group
+  membership, Protected Users coverage, password policy, and the Group Policy settings that enforce (or fail to
+  enforce) key protections such as SMB signing and NTLMv1 prevention. Each area has its own tab above.
+  <br /><br />
+  Privileged group membership is a snapshot resolved recursively through nested groups; hover over an amber
+  checkmark to see the nesting path, and over an underlined group name to see its resolved membership (capped at
+  the configured maximum; the full list is in the CSV evidence). Groups shown as "not resolved" could not be
+  located (for example because they do not exist at this functional level, or live in another domain of the
+  forest) and are evidence gaps rather than confirmed-empty groups.
+  <br /><br />
+  On the Group Policy tabs, structural scope shows domain/OU containers where a GPO appears in
+  InheritedGpoLinks. This is not the same as final effective (resultant) policy: security filtering, WMI
+  filtering, loopback processing, disabled GPO sections and client-side processing can still change what
+  actually applies on an endpoint. Use <code>gpresult /h</code> or <code>Get-GPResultantSetOfPolicy</code> for
+  endpoint-specific proof. Rows marked "Evaluation failed" could not be checked at all (even after retries) and
+  are gaps in this evidence set, not confirmed absence of a policy.
 </footer>
 
 <script>
@@ -2693,14 +2698,15 @@ function tooltipContentForSid(sid, trusteeName) {
 
 function renderSummary() {
   const s = data.summary;
+  const di = data.domainInfo || {};
   document.getElementById('summary-cards').innerHTML =
-    '<div class="card"><div class="card-value">' + s.relevantGpoCount + '</div><div class="card-label">GPOs with relevant settings</div></div>' +
-    '<div class="card card-insecure"><div class="card-value">' + s.findingsInsecure + '</div><div class="card-label">Insecure findings</div></div>' +
-    '<div class="card card-partial"><div class="card-value">' + s.findingsPartial + '</div><div class="card-label">Partially mitigated</div></div>' +
-    '<div class="card card-secure"><div class="card-value">' + s.findingsSecure + '</div><div class="card-label">Enforced / secure</div></div>' +
-    '<div class="card"><div class="card-value">' + (s.scopeTargetsTotal - s.scopeTargetsFailed) + '/' + s.scopeTargetsTotal + '</div><div class="card-label">OUs successfully evaluated</div></div>' +
+    '<div class="card"><div class="card-value">' + esc(di.domainMode || '&ndash;') + '</div><div class="card-label">Domain functional level</div></div>' +
     '<div class="card"><div class="card-value">' + s.domainControllerCount + '</div><div class="card-label">Domain controllers</div></div>' +
-    '<div class="card"><div class="card-value">' + s.protectedUsersMembers + '</div><div class="card-label">Protected Users members</div></div>';
+    '<div class="card"><div class="card-value">' + s.privilegedGroupsResolved + '/' + s.privilegedGroupsTotal + '</div><div class="card-label">Privileged groups enumerated</div></div>' +
+    '<div class="card"><div class="card-value">' + s.protectedUsersMembers + '</div><div class="card-label">Protected Users members</div></div>' +
+    '<div class="card card-insecure"><div class="card-value">' + s.findingsInsecure + '</div><div class="card-label">Insecure policy findings</div></div>' +
+    '<div class="card card-partial"><div class="card-value">' + s.findingsPartial + '</div><div class="card-label">Partially mitigated</div></div>' +
+    '<div class="card card-secure"><div class="card-value">' + s.findingsSecure + '</div><div class="card-label">Enforced / secure</div></div>';
 }
 
 function renderOverview() {

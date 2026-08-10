@@ -11,18 +11,31 @@
     - WMI filtering
     - Group Policy inheritance
 
+    In addition, the script collects:
+    - Domain information and a full domain controller inventory
+      (shown on the dashboard "Domain overview" cover tab)
+    - Protected Users membership, cross-referenced against the
+      administrative groups in the domain (checkmark matrix per user)
+    - Recursive privileged group membership, including groups that are
+      nested inside privileged groups (with the nesting path recorded)
+    - The default domain password policy and any fine-grained password
+      policies (PSOs)
+
     Also produces a single-file interactive HTML dashboard that lets you
     trace, per GPO and per OU/domain, whether a weak setting is mitigated,
     which security groups it applies to, and (on hover) who is in those
-    groups.
+    groups. The dashboard now opens with a domain overview cover tab and
+    contains dedicated tabs for privileged access and password policy.
 
 .DESCRIPTION
     This script is intended to be executed from a domain controller or a
     management system with the ActiveDirectory and GroupPolicy modules.
 
     The script uses language-independent registry paths and values instead
-    of localized Group Policy display names. This makes it suitable for
-    domains containing systems with different operating system languages.
+    of localized Group Policy display names. Privileged groups are located
+    by well-known SID/RID rather than by display name for the same reason.
+    This makes it suitable for domains containing systems with different
+    operating system languages.
 
     Security Options configured through Group Policy are read directly from
     GptTmpl.inf files in SYSVOL.
@@ -35,6 +48,10 @@
     - Structural inherited scope information
     - Security filtering information, plus resolved group membership
     - WMI filter information
+    - Domain information and domain controller inventory
+    - Recursive privileged group membership (including nested groups)
+    - A Protected Users x administrative groups matrix
+    - Default and fine-grained password policy evidence
     - A record of OUs/domain containers where inheritance could not be
       evaluated, even after retries
     - An interactive HTML dashboard (AUDIT-DASHBOARD.html) combining all
@@ -67,6 +84,26 @@
     -MaxGroupMembersToDisplay members are embedded in the dashboard, but
     the full list is still written to CSV. Use -ResolveGroupMembership:$false
     to skip this step entirely.
+
+    Privileged group membership is resolved recursively through the group
+    "Members" attribute (not Get-ADGroupMember), so a single unresolvable
+    member - for example a foreign security principal from a trusted
+    forest - does not abort enumeration of the whole group. Unresolvable
+    members are recorded with object type "unresolved". Members located in
+    other domains of the forest may not resolve against the selected
+    domain controller; they are recorded as unresolved rather than
+    silently dropped. Enterprise Admins, Schema Admins and Enterprise Key
+    Admins live in the forest root domain; in a child domain these lookups
+    can fail and are then recorded as unresolved groups (an evidence gap,
+    not an empty group).
+
+    The Protected Users group and the Key Admins groups only exist at
+    certain domain/forest functional levels. When a group does not exist,
+    it is reported as "not resolved" instead of failing the run.
+
+    Enumerating fine-grained password policies typically requires
+    Domain Admins-level read permissions on the Password Settings
+    Container. A failure there is recorded as an evidence gap.
 
     For computer-specific proof, supplement this domain-level evidence with:
         gpresult.exe /h GPResult.html
@@ -129,7 +166,11 @@ param (
 
     [Parameter()]
     [ValidateRange(0, 60000)]
-    [int]$GroupMembershipQueryDelayMs = 100
+    [int]$GroupMembershipQueryDelayMs = 100,
+
+    [Parameter()]
+    [ValidateRange(1, 25)]
+    [int]$MaxGroupNestingDepth = 10
 )
 
 Set-StrictMode -Version 2.0
@@ -185,6 +226,49 @@ function ConvertTo-StringValue {
     }
 
     return [string]$Value
+}
+
+function ConvertTo-TimeSpanDays {
+    <#
+        Converts a TimeSpan-typed password policy value to a number of
+        days, rounded to two decimals. A value of 0 means "not set /
+        never" in Active Directory password policy semantics.
+    #>
+    param (
+        [Parameter()]
+        [AllowNull()]
+        $Value
+    )
+
+    if ($null -eq $Value) {
+        return 0
+    }
+
+    try {
+        return [Math]::Round(([TimeSpan]$Value).TotalDays, 2)
+    }
+    catch {
+        return 0
+    }
+}
+
+function ConvertTo-TimeSpanMinutes {
+    param (
+        [Parameter()]
+        [AllowNull()]
+        $Value
+    )
+
+    if ($null -eq $Value) {
+        return 0
+    }
+
+    try {
+        return [Math]::Round(([TimeSpan]$Value).TotalMinutes, 2)
+    }
+    catch {
+        return 0
+    }
 }
 
 function Get-InfRegistryValue {
@@ -432,6 +516,227 @@ function Get-FindingSeverity {
     return [PSCustomObject]@{ Severity = "unknown"; Label = "Unclassified" }
 }
 
+function Get-RecursiveGroupMembership {
+    <#
+        Resolves a group's membership recursively using the "Members"
+        attribute rather than Get-ADGroupMember, so that a single
+        unresolvable member (for example a foreign security principal
+        from a trusted forest, or an orphaned member reference) does not
+        abort enumeration of the whole group.
+
+        Returns:
+          DirectMembers - the immediate members of the group
+          NestedGroups  - every group encountered at any depth, together
+                          with the nesting path through which it was
+                          reached ("Direct" or "GroupA > GroupB")
+          Members       - a flattened, de-duplicated list of all
+                          non-group members (users, computers, gMSAs,
+                          unresolved principals) with the nesting path
+                          recorded per member. When a member is reachable
+                          through multiple paths, the first path found is
+                          recorded.
+
+        Cycles in group nesting are detected and broken via a visited-set;
+        depth is additionally capped by -MaxDepth as a safety net.
+    #>
+    param (
+        [Parameter(Mandatory)]
+        [string]$GroupIdentity,
+
+        [Parameter(Mandatory)]
+        [string]$Server,
+
+        [Parameter()]
+        [ValidateRange(0, 60000)]
+        [int]$DelayMs = 0,
+
+        [Parameter()]
+        [ValidateRange(1, 25)]
+        [int]$MaxDepth = 10
+    )
+
+    $Result = [PSCustomObject]@{
+        Found         = $false
+        GroupName     = ""
+        GroupDn       = ""
+        GroupSid      = ""
+        Error         = ""
+        DirectMembers = @()
+        NestedGroups  = @()
+        Members       = @()
+    }
+
+    try {
+        $Group = Get-ADGroup `
+            -Identity $GroupIdentity `
+            -Server $Server `
+            -Properties Members `
+            -ErrorAction Stop
+    }
+    catch {
+        $Result.Error = $_.Exception.Message
+        return $Result
+    }
+
+    $Result.Found = $true
+    $Result.GroupName = [string]$Group.Name
+    $Result.GroupDn = [string]$Group.DistinguishedName
+    $Result.GroupSid = [string]$Group.SID.Value
+
+    $VisitedGroups = @{}
+    $VisitedGroups[[string]$Group.DistinguishedName] = $true
+
+    $MemberMap = @{}
+    $DirectMembers = New-Object System.Collections.Generic.List[object]
+    $NestedGroups = New-Object System.Collections.Generic.List[object]
+
+    $Queue = New-Object System.Collections.Generic.Queue[object]
+    $Queue.Enqueue(
+        [PSCustomObject]@{
+            MemberDns = @($Group.Members)
+            Via       = ""
+            Depth     = 0
+        }
+    )
+
+    while ($Queue.Count -gt 0) {
+        $Current = $Queue.Dequeue()
+
+        foreach ($MemberDn in @($Current.MemberDns)) {
+            $MemberDnString = [string]$MemberDn
+            $MemberName = ""
+            $MemberSam = ""
+            $MemberClass = ""
+            $MemberSid = ""
+            $Resolved = $true
+
+            try {
+                $MemberObject = Get-ADObject `
+                    -Identity $MemberDnString `
+                    -Server $Server `
+                    -Properties objectClass, sAMAccountName, objectSid `
+                    -ErrorAction Stop
+
+                $MemberName = [string]$MemberObject.Name
+                $MemberClass = [string]$MemberObject.objectClass
+
+                if (
+                    $MemberObject.PSObject.Properties.Match("sAMAccountName").Count -gt 0 -and
+                    $null -ne $MemberObject.sAMAccountName
+                ) {
+                    $MemberSam = [string]$MemberObject.sAMAccountName
+                }
+
+                if (
+                    $MemberObject.PSObject.Properties.Match("objectSid").Count -gt 0 -and
+                    $null -ne $MemberObject.objectSid
+                ) {
+                    $MemberSid = [string]$MemberObject.objectSid.Value
+                }
+            }
+            catch {
+                # For example a foreign security principal from a trusted
+                # forest, a member in another domain of the forest that the
+                # selected DC cannot resolve, or an orphaned member
+                # reference. Record it as unresolved instead of failing
+                # the whole group.
+                $Resolved = $false
+                $MemberClass = "unresolved"
+                $MemberName = (($MemberDnString -split ",", 2)[0]) -replace '^CN=', ''
+            }
+
+            $ViaLabel = "Direct"
+
+            if (-not [string]::IsNullOrEmpty([string]$Current.Via)) {
+                $ViaLabel = [string]$Current.Via
+            }
+
+            if ($Current.Depth -eq 0) {
+                $DirectMembers.Add(
+                    [PSCustomObject]@{
+                        Name           = $MemberName
+                        SamAccountName = $MemberSam
+                        ObjectClass    = $MemberClass
+                        Dn             = $MemberDnString
+                    }
+                )
+            }
+
+            if ($MemberClass -ieq "group") {
+                $NestedGroupError = ""
+                $NestedGroupExpanded = $false
+
+                if (
+                    -not $VisitedGroups.ContainsKey($MemberDnString) -and
+                    $Current.Depth -lt $MaxDepth
+                ) {
+                    $VisitedGroups[$MemberDnString] = $true
+
+                    try {
+                        $NestedGroup = Get-ADGroup `
+                            -Identity $MemberDnString `
+                            -Server $Server `
+                            -Properties Members `
+                            -ErrorAction Stop
+
+                        $NextVia = $MemberName
+
+                        if (-not [string]::IsNullOrEmpty([string]$Current.Via)) {
+                            $NextVia = "{0} > {1}" -f [string]$Current.Via, $MemberName
+                        }
+
+                        $Queue.Enqueue(
+                            [PSCustomObject]@{
+                                MemberDns = @($NestedGroup.Members)
+                                Via       = $NextVia
+                                Depth     = ($Current.Depth + 1)
+                            }
+                        )
+
+                        $NestedGroupExpanded = $true
+                    }
+                    catch {
+                        $NestedGroupError = $_.Exception.Message
+                    }
+                }
+
+                $NestedGroups.Add(
+                    [PSCustomObject]@{
+                        Name     = $MemberName
+                        Dn       = $MemberDnString
+                        Via      = $ViaLabel
+                        Expanded = $NestedGroupExpanded
+                        Error    = $NestedGroupError
+                    }
+                )
+            }
+            else {
+                if (-not $MemberMap.ContainsKey($MemberDnString)) {
+                    $MemberMap[$MemberDnString] = [PSCustomObject]@{
+                        Name           = $MemberName
+                        SamAccountName = $MemberSam
+                        ObjectClass    = $MemberClass
+                        Sid            = $MemberSid
+                        Dn             = $MemberDnString
+                        Via            = $ViaLabel
+                        Resolved       = $Resolved
+                    }
+                }
+            }
+        }
+
+        if ($DelayMs -gt 0) {
+            Start-Sleep -Milliseconds $DelayMs
+        }
+    }
+
+    $Result.DirectMembers = @($DirectMembers.ToArray())
+    $Result.NestedGroups = @($NestedGroups.ToArray())
+    $Result.Members = @($MemberMap.Values | Sort-Object Name)
+
+    return $Result
+}
+
 ###########################################################################
 # Validate required modules
 ###########################################################################
@@ -529,6 +834,7 @@ try {
         ResolveGroupMembership       = $ResolveGroupMembership
         MaxGroupMembersToDisplay     = $MaxGroupMembersToDisplay
         GroupMembershipQueryDelayMs  = $GroupMembershipQueryDelayMs
+        MaxGroupNestingDepth         = $MaxGroupNestingDepth
     }
 
     $Metadata |
@@ -1313,12 +1619,517 @@ try {
             -Encoding UTF8
 
     #######################################################################
+    # Collect domain information and domain controller inventory
+    #
+    # This feeds the "Domain overview" cover tab of the dashboard and the
+    # Domain-Information / Domain-Controllers CSV evidence files.
+    #######################################################################
+
+    Write-AuditLog "Collecting domain and domain controller information."
+
+    $Forest = Get-ADForest -Server $DomainController
+
+    $DomainControllerInventory = @(
+        Get-ADDomainController `
+            -Filter * `
+            -Server $DomainController |
+        Sort-Object HostName |
+        ForEach-Object {
+            [PSCustomObject]@{
+                Name                   = ConvertTo-StringValue -Value $_.Name
+                HostName               = ConvertTo-StringValue -Value $_.HostName
+                IPv4Address            = ConvertTo-StringValue -Value $_.IPv4Address
+                Site                   = ConvertTo-StringValue -Value $_.Site
+                OperatingSystem        = ConvertTo-StringValue -Value $_.OperatingSystem
+                OperatingSystemVersion = ConvertTo-StringValue -Value $_.OperatingSystemVersion
+                IsGlobalCatalog        = [bool]$_.IsGlobalCatalog
+                IsReadOnly             = [bool]$_.IsReadOnly
+                OperationMasterRoles   = (
+                    @($_.OperationMasterRoles | ForEach-Object { [string]$_ }) -join ", "
+                )
+            }
+        }
+    )
+
+    Write-AuditLog "Found $($DomainControllerInventory.Count) domain controller(s)."
+
+    $DomainControllerInventory |
+        Export-Csv `
+            -Path (Join-Path $Directories.Csv "Domain-Controllers.csv") `
+            -NoTypeInformation `
+            -Encoding UTF8
+
+    $DomainInformation = [PSCustomObject]@{
+        DnsRoot               = $DomainDnsRoot
+        NetBiosName           = ConvertTo-StringValue -Value $Domain.NetBIOSName
+        DistinguishedName     = $DomainDistinguishedName
+        DomainSid             = [string]$Domain.DomainSID.Value
+        DomainMode            = ConvertTo-StringValue -Value $Domain.DomainMode
+        ForestName            = ConvertTo-StringValue -Value $Forest.Name
+        ForestMode            = ConvertTo-StringValue -Value $Forest.ForestMode
+        PdcEmulator           = ConvertTo-StringValue -Value $Domain.PDCEmulator
+        RidMaster             = ConvertTo-StringValue -Value $Domain.RIDMaster
+        InfrastructureMaster  = ConvertTo-StringValue -Value $Domain.InfrastructureMaster
+        SchemaMaster          = ConvertTo-StringValue -Value $Forest.SchemaMaster
+        DomainNamingMaster    = ConvertTo-StringValue -Value $Forest.DomainNamingMaster
+        DomainControllerCount = $DomainControllerInventory.Count
+    }
+
+    $DomainInformation |
+        Export-Csv `
+            -Path (Join-Path $Directories.Csv "Domain-Information.csv") `
+            -NoTypeInformation `
+            -Encoding UTF8
+
+    #######################################################################
+    # Collect password policy evidence
+    #
+    # The default domain password policy is read via
+    # Get-ADDefaultDomainPasswordPolicy; fine-grained password policies
+    # (PSOs) are enumerated separately. Reading PSOs typically requires
+    # Domain Admins-level permissions; failures are recorded as evidence
+    # gaps rather than aborting the run.
+    #######################################################################
+
+    Write-AuditLog "Collecting password policy information."
+
+    $DefaultPasswordPolicyDashboard = $null
+    $DefaultPasswordPolicyError = ""
+
+    try {
+        $DefaultPasswordPolicy = Get-ADDefaultDomainPasswordPolicy `
+            -Server $DomainController `
+            -ErrorAction Stop
+
+        $DefaultPasswordPolicyDashboard = [PSCustomObject]@{
+            minPasswordLength           = [int]$DefaultPasswordPolicy.MinPasswordLength
+            complexityEnabled           = [bool]$DefaultPasswordPolicy.ComplexityEnabled
+            passwordHistoryCount        = [int]$DefaultPasswordPolicy.PasswordHistoryCount
+            maxPasswordAgeDays          = ConvertTo-TimeSpanDays -Value $DefaultPasswordPolicy.MaxPasswordAge
+            minPasswordAgeDays          = ConvertTo-TimeSpanDays -Value $DefaultPasswordPolicy.MinPasswordAge
+            lockoutThreshold            = [int]$DefaultPasswordPolicy.LockoutThreshold
+            lockoutDurationMinutes      = ConvertTo-TimeSpanMinutes -Value $DefaultPasswordPolicy.LockoutDuration
+            lockoutObservationMinutes   = ConvertTo-TimeSpanMinutes -Value $DefaultPasswordPolicy.LockoutObservationWindow
+            reversibleEncryptionEnabled = [bool]$DefaultPasswordPolicy.ReversibleEncryptionEnabled
+            distinguishedName           = ConvertTo-StringValue -Value $DefaultPasswordPolicy.DistinguishedName
+        }
+
+        [PSCustomObject]@{
+            PolicyType                  = "Default domain password policy"
+            MinPasswordLength           = $DefaultPasswordPolicyDashboard.minPasswordLength
+            ComplexityEnabled           = $DefaultPasswordPolicyDashboard.complexityEnabled
+            PasswordHistoryCount        = $DefaultPasswordPolicyDashboard.passwordHistoryCount
+            MaxPasswordAgeDays          = $DefaultPasswordPolicyDashboard.maxPasswordAgeDays
+            MinPasswordAgeDays          = $DefaultPasswordPolicyDashboard.minPasswordAgeDays
+            LockoutThreshold            = $DefaultPasswordPolicyDashboard.lockoutThreshold
+            LockoutDurationMinutes      = $DefaultPasswordPolicyDashboard.lockoutDurationMinutes
+            LockoutObservationMinutes   = $DefaultPasswordPolicyDashboard.lockoutObservationMinutes
+            ReversibleEncryptionEnabled = $DefaultPasswordPolicyDashboard.reversibleEncryptionEnabled
+            DistinguishedName           = $DefaultPasswordPolicyDashboard.distinguishedName
+        } |
+            Export-Csv `
+                -Path (Join-Path $Directories.Csv "Password-Policy.csv") `
+                -NoTypeInformation `
+                -Encoding UTF8
+    }
+    catch {
+        $DefaultPasswordPolicyError = $_.Exception.Message
+
+        Write-AuditLog `
+            -Level "WARNING" `
+            -Message (
+                "Could not read the default domain password policy: {0}" -f
+                $DefaultPasswordPolicyError
+            )
+    }
+
+    $FineGrainedPolicyDashboard = New-Object System.Collections.Generic.List[object]
+    $FineGrainedPolicyCsvRows = New-Object System.Collections.Generic.List[object]
+    $FineGrainedPolicyError = ""
+
+    try {
+        $FineGrainedPolicies = @(
+            Get-ADFineGrainedPasswordPolicy `
+                -Filter * `
+                -Server $DomainController `
+                -ErrorAction Stop |
+            Sort-Object Precedence, Name
+        )
+
+        foreach ($FineGrainedPolicy in $FineGrainedPolicies) {
+            $AppliesToNames = New-Object System.Collections.Generic.List[string]
+            $AppliesToDns = @()
+
+            if (
+                $FineGrainedPolicy.PSObject.Properties.Match("AppliesTo").Count -gt 0 -and
+                $null -ne $FineGrainedPolicy.AppliesTo
+            ) {
+                $AppliesToDns = @($FineGrainedPolicy.AppliesTo)
+            }
+
+            foreach ($AppliesToDn in $AppliesToDns) {
+                try {
+                    $AppliesToObject = Get-ADObject `
+                        -Identity ([string]$AppliesToDn) `
+                        -Server $DomainController `
+                        -ErrorAction Stop
+
+                    $AppliesToNames.Add([string]$AppliesToObject.Name)
+                }
+                catch {
+                    # Keep the raw DN if the target cannot be resolved.
+                    $AppliesToNames.Add([string]$AppliesToDn)
+                }
+            }
+
+            $FineGrainedPolicyDashboard.Add(
+                [PSCustomObject]@{
+                    name                        = ConvertTo-StringValue -Value $FineGrainedPolicy.Name
+                    precedence                  = [int]$FineGrainedPolicy.Precedence
+                    appliesTo                   = @($AppliesToNames.ToArray())
+                    minPasswordLength           = [int]$FineGrainedPolicy.MinPasswordLength
+                    complexityEnabled           = [bool]$FineGrainedPolicy.ComplexityEnabled
+                    passwordHistoryCount        = [int]$FineGrainedPolicy.PasswordHistoryCount
+                    maxPasswordAgeDays          = ConvertTo-TimeSpanDays -Value $FineGrainedPolicy.MaxPasswordAge
+                    minPasswordAgeDays          = ConvertTo-TimeSpanDays -Value $FineGrainedPolicy.MinPasswordAge
+                    lockoutThreshold            = [int]$FineGrainedPolicy.LockoutThreshold
+                    lockoutDurationMinutes      = ConvertTo-TimeSpanMinutes -Value $FineGrainedPolicy.LockoutDuration
+                    lockoutObservationMinutes   = ConvertTo-TimeSpanMinutes -Value $FineGrainedPolicy.LockoutObservationWindow
+                    reversibleEncryptionEnabled = [bool]$FineGrainedPolicy.ReversibleEncryptionEnabled
+                }
+            )
+
+            $FineGrainedPolicyCsvRows.Add(
+                [PSCustomObject]@{
+                    PolicyType                  = "Fine-grained password policy"
+                    Name                        = ConvertTo-StringValue -Value $FineGrainedPolicy.Name
+                    Precedence                  = [int]$FineGrainedPolicy.Precedence
+                    AppliesTo                   = ($AppliesToNames.ToArray() -join "; ")
+                    MinPasswordLength           = [int]$FineGrainedPolicy.MinPasswordLength
+                    ComplexityEnabled           = [bool]$FineGrainedPolicy.ComplexityEnabled
+                    PasswordHistoryCount        = [int]$FineGrainedPolicy.PasswordHistoryCount
+                    MaxPasswordAgeDays          = ConvertTo-TimeSpanDays -Value $FineGrainedPolicy.MaxPasswordAge
+                    MinPasswordAgeDays          = ConvertTo-TimeSpanDays -Value $FineGrainedPolicy.MinPasswordAge
+                    LockoutThreshold            = [int]$FineGrainedPolicy.LockoutThreshold
+                    LockoutDurationMinutes      = ConvertTo-TimeSpanMinutes -Value $FineGrainedPolicy.LockoutDuration
+                    LockoutObservationMinutes   = ConvertTo-TimeSpanMinutes -Value $FineGrainedPolicy.LockoutObservationWindow
+                    ReversibleEncryptionEnabled = [bool]$FineGrainedPolicy.ReversibleEncryptionEnabled
+                }
+            )
+        }
+
+        Write-AuditLog "Found $($FineGrainedPolicyDashboard.Count) fine-grained password policy object(s)."
+    }
+    catch {
+        $FineGrainedPolicyError = $_.Exception.Message
+
+        Write-AuditLog `
+            -Level "WARNING" `
+            -Message (
+                "Could not enumerate fine-grained password policies (this typically requires Domain Admins-level read access): {0}" -f
+                $FineGrainedPolicyError
+            )
+    }
+
+    $FineGrainedPolicyCsvRows |
+        Export-Csv `
+            -Path (Join-Path $Directories.Csv "Fine-Grained-Password-Policies.csv") `
+            -NoTypeInformation `
+            -Encoding UTF8
+
+    #######################################################################
+    # Collect privileged group membership and Protected Users evidence
+    #
+    # Groups are located by well-known SID/RID so the collection is
+    # language independent. Membership is resolved recursively via the
+    # "Members" attribute; nested groups are recorded together with the
+    # nesting path so a reviewer can see through which intermediate group
+    # a member was reached.
+    #
+    # The dashboard's "Privileged access" tab shows every member of the
+    # built-in Protected Users group, with one column per administrative
+    # group and a checkmark when the user is (directly or via nesting) a
+    # member of that group.
+    #######################################################################
+
+    Write-AuditLog "Collecting privileged group and Protected Users membership."
+
+    $DomainSid = [string]$Domain.DomainSID.Value
+    $RootDomainSid = ""
+
+    if ($Forest.RootDomain -ieq $DomainDnsRoot) {
+        $RootDomainSid = $DomainSid
+    }
+    else {
+        try {
+            $RootDomain = Get-ADDomain -Identity $Forest.RootDomain
+            $RootDomainSid = [string]$RootDomain.DomainSID.Value
+        }
+        catch {
+            Write-AuditLog `
+                -Level "WARNING" `
+                -Message (
+                    "Could not resolve the forest root domain '{0}'; Enterprise Admins, Schema Admins and Enterprise Key Admins will be skipped: {1}" -f
+                    $Forest.RootDomain,
+                    $_.Exception.Message
+                )
+        }
+    }
+
+    # Column/definition order below is also the column order of the
+    # Protected Users matrix in the dashboard and CSV.
+    $PrivilegedGroupDefinitions = New-Object System.Collections.Generic.List[object]
+
+    $PrivilegedGroupDefinitions.Add(
+        [PSCustomObject]@{ DisplayName = "Domain Admins"; Identity = "$DomainSid-512" }
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($RootDomainSid)) {
+        $PrivilegedGroupDefinitions.Add(
+            [PSCustomObject]@{ DisplayName = "Enterprise Admins"; Identity = "$RootDomainSid-519" }
+        )
+        $PrivilegedGroupDefinitions.Add(
+            [PSCustomObject]@{ DisplayName = "Schema Admins"; Identity = "$RootDomainSid-518" }
+        )
+    }
+
+    $PrivilegedGroupDefinitions.Add(
+        [PSCustomObject]@{ DisplayName = "Administrators (built-in)"; Identity = "S-1-5-32-544" }
+    )
+    $PrivilegedGroupDefinitions.Add(
+        [PSCustomObject]@{ DisplayName = "Account Operators"; Identity = "S-1-5-32-548" }
+    )
+    $PrivilegedGroupDefinitions.Add(
+        [PSCustomObject]@{ DisplayName = "Server Operators"; Identity = "S-1-5-32-549" }
+    )
+    $PrivilegedGroupDefinitions.Add(
+        [PSCustomObject]@{ DisplayName = "Backup Operators"; Identity = "S-1-5-32-551" }
+    )
+    $PrivilegedGroupDefinitions.Add(
+        [PSCustomObject]@{ DisplayName = "Print Operators"; Identity = "S-1-5-32-550" }
+    )
+    $PrivilegedGroupDefinitions.Add(
+        [PSCustomObject]@{ DisplayName = "Group Policy Creator Owners"; Identity = "$DomainSid-520" }
+    )
+    $PrivilegedGroupDefinitions.Add(
+        [PSCustomObject]@{ DisplayName = "Key Admins"; Identity = "$DomainSid-526" }
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($RootDomainSid)) {
+        $PrivilegedGroupDefinitions.Add(
+            [PSCustomObject]@{ DisplayName = "Enterprise Key Admins"; Identity = "$RootDomainSid-527" }
+        )
+    }
+
+    # DnsAdmins has no well-known SID; it is located by sAMAccountName,
+    # which is not localized. If it does not exist (no DNS role in the
+    # domain) this is recorded as "not resolved".
+    $PrivilegedGroupDefinitions.Add(
+        [PSCustomObject]@{ DisplayName = "DnsAdmins"; Identity = "DnsAdmins" }
+    )
+
+    $PrivilegedGroupResults = New-Object System.Collections.Generic.List[object]
+    $PrivilegedGroupMemberCsvRows = New-Object System.Collections.Generic.List[object]
+    $PrivilegedGroupNestedCsvRows = New-Object System.Collections.Generic.List[object]
+
+    foreach ($GroupDefinition in $PrivilegedGroupDefinitions) {
+        Write-AuditLog "Resolving privileged group: $($GroupDefinition.DisplayName)"
+
+        $Resolution = Get-RecursiveGroupMembership `
+            -GroupIdentity $GroupDefinition.Identity `
+            -Server $DomainController `
+            -DelayMs $GroupMembershipQueryDelayMs `
+            -MaxDepth $MaxGroupNestingDepth
+
+        if (-not $Resolution.Found) {
+            Write-AuditLog `
+                -Level "WARNING" `
+                -Message (
+                    "Privileged group '{0}' could not be resolved: {1}" -f
+                    $GroupDefinition.DisplayName,
+                    $Resolution.Error
+                )
+        }
+
+        $PrivilegedGroupResults.Add(
+            [PSCustomObject]@{
+                DisplayName = $GroupDefinition.DisplayName
+                Resolution  = $Resolution
+            }
+        )
+
+        foreach ($Member in @($Resolution.Members)) {
+            $PrivilegedGroupMemberCsvRows.Add(
+                [PSCustomObject]@{
+                    GroupDisplayName     = $GroupDefinition.DisplayName
+                    GroupName            = $Resolution.GroupName
+                    GroupSid             = $Resolution.GroupSid
+                    MemberName           = $Member.Name
+                    MemberSamAccountName = $Member.SamAccountName
+                    MemberType           = $Member.ObjectClass
+                    MembershipPath       = $Member.Via
+                    MemberDn             = $Member.Dn
+                }
+            )
+        }
+
+        foreach ($NestedGroup in @($Resolution.NestedGroups)) {
+            $PrivilegedGroupNestedCsvRows.Add(
+                [PSCustomObject]@{
+                    GroupDisplayName = $GroupDefinition.DisplayName
+                    GroupName        = $Resolution.GroupName
+                    NestedGroupName  = $NestedGroup.Name
+                    NestedVia        = $NestedGroup.Via
+                    Expanded         = $NestedGroup.Expanded
+                    ExpansionError   = $NestedGroup.Error
+                    NestedGroupDn    = $NestedGroup.Dn
+                }
+            )
+        }
+    }
+
+    $PrivilegedGroupMemberCsvRows |
+        Sort-Object GroupDisplayName, MemberName |
+        Export-Csv `
+            -Path (Join-Path $Directories.Csv "Privileged-Group-Members.csv") `
+            -NoTypeInformation `
+            -Encoding UTF8
+
+    $PrivilegedGroupNestedCsvRows |
+        Sort-Object GroupDisplayName, NestedGroupName |
+        Export-Csv `
+            -Path (Join-Path $Directories.Csv "Privileged-Group-Nested-Groups.csv") `
+            -NoTypeInformation `
+            -Encoding UTF8
+
+    #######################################################################
+    # Resolve the Protected Users group (well-known RID 525) and build the
+    # Protected Users x administrative groups matrix
+    #######################################################################
+
+    $ProtectedUsersResolution = Get-RecursiveGroupMembership `
+        -GroupIdentity "$DomainSid-525" `
+        -Server $DomainController `
+        -DelayMs $GroupMembershipQueryDelayMs `
+        -MaxDepth $MaxGroupNestingDepth
+
+    if (-not $ProtectedUsersResolution.Found) {
+        Write-AuditLog `
+            -Level "WARNING" `
+            -Message (
+                "The Protected Users group could not be resolved (it requires a Windows Server 2012 R2 or higher domain functional level): {0}" -f
+                $ProtectedUsersResolution.Error
+            )
+    }
+    else {
+        Write-AuditLog (
+            "Protected Users contains {0} resolved member(s) ({1} direct entr(y/ies), {2} nested group(s))." -f
+            @($ProtectedUsersResolution.Members).Count,
+            @($ProtectedUsersResolution.DirectMembers).Count,
+            @($ProtectedUsersResolution.NestedGroups).Count
+        )
+    }
+
+    $MatrixGroupNames = New-Object System.Collections.Generic.List[string]
+    $AdminMembershipLookup = @{}
+
+    foreach ($PrivilegedGroup in $PrivilegedGroupResults) {
+        if (-not $PrivilegedGroup.Resolution.Found) {
+            continue
+        }
+
+        $MatrixGroupNames.Add($PrivilegedGroup.DisplayName)
+        $MembershipLookup = @{}
+
+        foreach ($Member in @($PrivilegedGroup.Resolution.Members)) {
+            if (-not $MembershipLookup.ContainsKey($Member.Dn)) {
+                $MembershipLookup[$Member.Dn] = [string]$Member.Via
+            }
+        }
+
+        $AdminMembershipLookup[$PrivilegedGroup.DisplayName] = $MembershipLookup
+    }
+
+    $ProtectedUserMatrix = New-Object System.Collections.Generic.List[object]
+    $ProtectedUsersMatrixCsvRows = New-Object System.Collections.Generic.List[object]
+
+    if ($ProtectedUsersResolution.Found) {
+        foreach ($ProtectedUser in @($ProtectedUsersResolution.Members)) {
+            $Memberships = [ordered]@{}
+
+            $CsvRow = [ordered]@{
+                UserName          = $ProtectedUser.Name
+                SamAccountName    = $ProtectedUser.SamAccountName
+                ObjectType        = $ProtectedUser.ObjectClass
+                ProtectedUsersVia = $ProtectedUser.Via
+            }
+
+            foreach ($MatrixGroupName in $MatrixGroupNames) {
+                $MembershipLookup = $AdminMembershipLookup[$MatrixGroupName]
+
+                if ($MembershipLookup.ContainsKey($ProtectedUser.Dn)) {
+                    $Via = [string]$MembershipLookup[$ProtectedUser.Dn]
+
+                    $Memberships[$MatrixGroupName] = [PSCustomObject]@{
+                        member = $true
+                        via    = $Via
+                    }
+
+                    if ($Via -eq "Direct") {
+                        $CsvRow[$MatrixGroupName] = "Yes (direct)"
+                    }
+                    else {
+                        $CsvRow[$MatrixGroupName] = "Yes (via $Via)"
+                    }
+                }
+                else {
+                    $Memberships[$MatrixGroupName] = [PSCustomObject]@{
+                        member = $false
+                        via    = ""
+                    }
+
+                    $CsvRow[$MatrixGroupName] = "No"
+                }
+            }
+
+            $ProtectedUserMatrix.Add(
+                [PSCustomObject]@{
+                    name        = $ProtectedUser.Name
+                    sam         = $ProtectedUser.SamAccountName
+                    objectClass = $ProtectedUser.ObjectClass
+                    via         = $ProtectedUser.Via
+                    memberships = $Memberships
+                }
+            )
+
+            $ProtectedUsersMatrixCsvRows.Add([PSCustomObject]$CsvRow)
+        }
+    }
+
+    $ProtectedUsersMatrixCsvRows |
+        Export-Csv `
+            -Path (Join-Path $Directories.Csv "Protected-Users-Admin-Matrix.csv") `
+            -NoTypeInformation `
+            -Encoding UTF8
+
+    $ProtectedUsersMemberCount = 0
+
+    if ($ProtectedUsersResolution.Found) {
+        $ProtectedUsersMemberCount = @($ProtectedUsersResolution.Members).Count
+    }
+
+    $ResolvedPrivilegedGroupCount = @(
+        $PrivilegedGroupResults | Where-Object { $_.Resolution.Found }
+    ).Count
+
+    #######################################################################
     # Build interactive HTML dashboard
     #
-    # Combines configured findings, structural scope and security filtering
-    # (with resolved group membership) into a single browsable file so a
-    # reviewer can trace, per GPO or per OU/domain, whether a weak setting
-    # is mitigated and who it applies to.
+    # Combines configured findings, structural scope, security filtering
+    # (with resolved group membership), domain information, privileged
+    # access evidence and password policy into a single browsable file so
+    # a reviewer can trace, per GPO and per OU/domain, whether a weak
+    # setting is mitigated and who it applies to.
     #######################################################################
 
     Write-AuditLog "Building interactive audit dashboard."
@@ -1516,6 +2327,85 @@ try {
         )
     }
 
+    #######################################################################
+    # Assemble the new dashboard sections (domain overview, privileged
+    # access, password policy)
+    #######################################################################
+
+    $DashboardDomainInfo = [PSCustomObject]@{
+        dnsRoot              = $DomainInformation.DnsRoot
+        netBiosName          = $DomainInformation.NetBiosName
+        distinguishedName    = $DomainInformation.DistinguishedName
+        domainSid            = $DomainInformation.DomainSid
+        domainMode           = $DomainInformation.DomainMode
+        forestName           = $DomainInformation.ForestName
+        forestMode           = $DomainInformation.ForestMode
+        pdcEmulator          = $DomainInformation.PdcEmulator
+        ridMaster            = $DomainInformation.RidMaster
+        infrastructureMaster = $DomainInformation.InfrastructureMaster
+        schemaMaster         = $DomainInformation.SchemaMaster
+        domainNamingMaster   = $DomainInformation.DomainNamingMaster
+        domainControllers    = @(
+            $DomainControllerInventory |
+            ForEach-Object {
+                [PSCustomObject]@{
+                    name                   = $_.Name
+                    hostName               = $_.HostName
+                    ipv4Address            = $_.IPv4Address
+                    site                   = $_.Site
+                    operatingSystem        = $_.OperatingSystem
+                    operatingSystemVersion = $_.OperatingSystemVersion
+                    isGlobalCatalog        = $_.IsGlobalCatalog
+                    isReadOnly             = $_.IsReadOnly
+                    operationMasterRoles   = $_.OperationMasterRoles
+                }
+            }
+        )
+    }
+
+    $DashboardPrivilegedGroups = @(
+        $PrivilegedGroupResults |
+        ForEach-Object {
+            $Resolution = $_.Resolution
+            $AllMembers = @($Resolution.Members)
+
+            $DisplayedMembers = @(
+                $AllMembers |
+                Select-Object -First $MaxGroupMembersToDisplay |
+                ForEach-Object {
+                    [PSCustomObject]@{
+                        name = $_.Name
+                        sam  = $_.SamAccountName
+                        type = $_.ObjectClass
+                        via  = $_.Via
+                    }
+                }
+            )
+
+            [PSCustomObject]@{
+                displayName  = $_.DisplayName
+                found        = [bool]$Resolution.Found
+                error        = $Resolution.Error
+                groupName    = $Resolution.GroupName
+                sid          = $Resolution.GroupSid
+                memberCount  = $AllMembers.Count
+                truncated    = ($AllMembers.Count -gt $MaxGroupMembersToDisplay)
+                nestedGroups = @(
+                    $Resolution.NestedGroups |
+                    ForEach-Object {
+                        [PSCustomObject]@{
+                            name     = $_.Name
+                            via      = $_.Via
+                            expanded = $_.Expanded
+                            error    = $_.Error
+                        }
+                    }
+                )
+                members      = $DisplayedMembers
+            }
+        }
+    )
+
     # Normalize generic lists before JSON serialization. This avoids a
     # Windows PowerShell 5.1 binder issue involving List[object] values.
     $DashboardGposArray = $DashboardGpos.ToArray()
@@ -1526,21 +2416,43 @@ try {
         domain           = $DomainDnsRoot
         domainController = $DomainController
         summary          = [PSCustomObject]@{
-            totalGposScanned   = $Gpos.Count
-            relevantGpoCount   = $RelevantGpoIds.Count
-            findingsSecure     = $SecureFindingCount
-            findingsPartial    = $PartialFindingCount
-            findingsInsecure   = $InsecureFindingCount
-            findingsUnknown    = $UnknownFindingCount
-            scopeTargetsTotal  = $ScopeTargets.Count
-            scopeTargetsFailed = $InheritanceErrorResults.Count
+            totalGposScanned         = $Gpos.Count
+            relevantGpoCount         = $RelevantGpoIds.Count
+            findingsSecure           = $SecureFindingCount
+            findingsPartial          = $PartialFindingCount
+            findingsInsecure         = $InsecureFindingCount
+            findingsUnknown          = $UnknownFindingCount
+            scopeTargetsTotal        = $ScopeTargets.Count
+            scopeTargetsFailed       = $InheritanceErrorResults.Count
+            domainControllerCount    = $DomainControllerInventory.Count
+            protectedUsersMembers    = $ProtectedUsersMemberCount
+            privilegedGroupsResolved = $ResolvedPrivilegedGroupCount
+            privilegedGroupsTotal    = $PrivilegedGroupDefinitions.Count
+        }
+        domainInfo       = $DashboardDomainInfo
+        passwordPolicy   = [PSCustomObject]@{
+            defaultPolicy      = $DefaultPasswordPolicyDashboard
+            defaultPolicyError = $DefaultPasswordPolicyError
+            fineGrained        = @($FineGrainedPolicyDashboard.ToArray())
+            fineGrainedError   = $FineGrainedPolicyError
+        }
+        privilegedAccess = [PSCustomObject]@{
+            groupColumns   = @($MatrixGroupNames.ToArray())
+            groups         = $DashboardPrivilegedGroups
+            protectedUsers = [PSCustomObject]@{
+                found       = [bool]$ProtectedUsersResolution.Found
+                error       = $ProtectedUsersResolution.Error
+                groupName   = $ProtectedUsersResolution.GroupName
+                memberCount = $ProtectedUsersMemberCount
+                users       = @($ProtectedUserMatrix.ToArray())
+            }
         }
         gpos             = $DashboardGposArray
         scopeTargets     = $DashboardScopeTargetsArray
         groupMembers     = $GroupMembershipCache
     }
 
-    $DashboardJson = $DashboardData | ConvertTo-Json -Depth 15
+    $DashboardJson = $DashboardData | ConvertTo-Json -Depth 20
     $DashboardJsonPath = Join-Path $Directories.Metadata "Dashboard-Data.json"
     $DashboardJson | Set-Content -LiteralPath $DashboardJsonPath -Encoding UTF8
 
@@ -1586,7 +2498,7 @@ header .meta { color: var(--muted); font-size: 13px; }
 .card-insecure .card-value { color: var(--insecure); }
 .card-partial .card-value { color: var(--partial); }
 .card-secure .card-value { color: var(--secure); }
-.tabs { display: flex; gap: 4px; padding: 20px 32px 0; border-bottom: 1px solid var(--border); }
+.tabs { display: flex; gap: 4px; padding: 20px 32px 0; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
 .tab-btn { border: none; background: none; padding: 10px 16px; cursor: pointer; font-size: 14px; color: var(--muted); border-bottom: 2px solid transparent; }
 .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
 .tab-panel { display: none; padding: 20px 32px 40px; }
@@ -1601,7 +2513,7 @@ header .meta { color: var(--muted); font-size: 13px; }
 .badge-insecure { background: var(--insecure-bg); color: var(--insecure); }
 .badge-unknown { background: var(--unknown-bg); color: var(--unknown); }
 .gpo-block, .scope-block { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; margin-bottom: 10px; overflow: hidden; }
-.gpo-block summary { padding: 14px 18px; cursor: pointer; display: flex; gap: 12px; align-items: center; list-style: none; }
+.gpo-block summary { padding: 14px 18px; cursor: pointer; display: flex; gap: 12px; align-items: center; list-style: none; flex-wrap: wrap; }
 .gpo-block summary::-webkit-details-marker { display: none; }
 .gpo-name { font-weight: 600; }
 .gpo-body { padding: 0 18px 18px; }
@@ -1640,6 +2552,20 @@ footer { padding: 20px 32px 40px; color: var(--muted); font-size: 12px; border-t
 .member-tooltip .tooltip-muted { color: #9ca3af; }
 .member-tooltip ul.tooltip-list { margin: 0; padding-left: 16px; }
 .member-tooltip .tooltip-type { color: #9ca3af; }
+.section-block { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; margin-bottom: 14px; }
+.section-block h3 { margin: 0 0 12px; font-size: 15px; }
+.kv-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.kv-table td { padding: 7px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.kv-table td:first-child { color: var(--muted); width: 260px; }
+.matrix-wrap { overflow-x: auto; }
+.matrix-table { border-collapse: collapse; font-size: 13px; width: 100%; }
+.matrix-table th, .matrix-table td { padding: 8px 10px; border-bottom: 1px solid var(--border); text-align: center; white-space: nowrap; }
+.matrix-table th:first-child, .matrix-table td:first-child { text-align: left; position: sticky; left: 0; background: var(--surface); }
+.matrix-table th { font-size: 12px; }
+.check-direct { color: var(--secure); font-weight: 700; font-size: 15px; }
+.check-nested { color: var(--partial); font-weight: 700; font-size: 15px; border-bottom: 1px dotted var(--partial); cursor: help; }
+.check-none { color: #cbd5e1; }
+.legend { margin: 10px 0 0; }
 @media (max-width: 720px) { .gpo-columns { grid-template-columns: 1fr; } }
 </style>
 </head>
@@ -1655,11 +2581,18 @@ footer { padding: 20px 32px 40px; color: var(--muted); font-size: 12px; border-t
 <section class="summary-cards" id="summary-cards"></section>
 
 <nav class="tabs">
-  <button class="tab-btn active" data-tab="policies">By GPO / policy</button>
+  <button class="tab-btn active" data-tab="overview">Domain overview</button>
+  <button class="tab-btn" data-tab="policies">By GPO / policy</button>
   <button class="tab-btn" data-tab="scope">By OU / domain</button>
+  <button class="tab-btn" data-tab="privileged">Privileged access</button>
+  <button class="tab-btn" data-tab="pwpolicy">Password policy</button>
 </nav>
 
-<section id="tab-policies" class="tab-panel active">
+<section id="tab-overview" class="tab-panel active">
+  <div id="overview-container"></div>
+</section>
+
+<section id="tab-policies" class="tab-panel">
   <div class="controls">
     <input type="text" id="policy-search" placeholder="Search GPO name, category, setting..." />
     <select id="severity-filter">
@@ -1681,6 +2614,14 @@ footer { padding: 20px 32px 40px; color: var(--muted); font-size: 12px; border-t
   <div id="scope-container"></div>
 </section>
 
+<section id="tab-privileged" class="tab-panel">
+  <div id="privileged-container"></div>
+</section>
+
+<section id="tab-pwpolicy" class="tab-panel">
+  <div id="pwpolicy-container"></div>
+</section>
+
 <footer>
   Structural scope shows domain/OU containers where a GPO appears in InheritedGpoLinks. This is not the same as
   final effective (resultant) policy: security filtering, WMI filtering, loopback processing, disabled GPO
@@ -1688,7 +2629,11 @@ footer { padding: 20px 32px 40px; color: var(--muted); font-size: 12px; border-t
   <code>gpresult /h</code> or <code>Get-GPResultantSetOfPolicy</code> for endpoint-specific proof. Rows marked
   "Evaluation failed" could not be checked at all (even after retries) and are gaps in this evidence set, not
   confirmed absence of a policy. Hover over an underlined group name to see its resolved membership (capped at
-  the configured maximum; the full list is in the CSV evidence).
+  the configured maximum; the full list is in the CSV evidence). Privileged group membership on the
+  "Privileged access" tab is a point-in-time snapshot resolved recursively through nested groups; hover over an
+  amber checkmark to see the nesting path. Groups shown as "not resolved" could not be located (for example
+  because they do not exist at this functional level, or live in another domain of the forest) and are evidence
+  gaps rather than confirmed-empty groups.
 </footer>
 
 <script>
@@ -1753,7 +2698,59 @@ function renderSummary() {
     '<div class="card card-insecure"><div class="card-value">' + s.findingsInsecure + '</div><div class="card-label">Insecure findings</div></div>' +
     '<div class="card card-partial"><div class="card-value">' + s.findingsPartial + '</div><div class="card-label">Partially mitigated</div></div>' +
     '<div class="card card-secure"><div class="card-value">' + s.findingsSecure + '</div><div class="card-label">Enforced / secure</div></div>' +
-    '<div class="card"><div class="card-value">' + (s.scopeTargetsTotal - s.scopeTargetsFailed) + '/' + s.scopeTargetsTotal + '</div><div class="card-label">OUs successfully evaluated</div></div>';
+    '<div class="card"><div class="card-value">' + (s.scopeTargetsTotal - s.scopeTargetsFailed) + '/' + s.scopeTargetsTotal + '</div><div class="card-label">OUs successfully evaluated</div></div>' +
+    '<div class="card"><div class="card-value">' + s.domainControllerCount + '</div><div class="card-label">Domain controllers</div></div>' +
+    '<div class="card"><div class="card-value">' + s.protectedUsersMembers + '</div><div class="card-label">Protected Users members</div></div>';
+}
+
+function renderOverview() {
+  const container = document.getElementById('overview-container');
+  const d = data.domainInfo || null;
+
+  if (!d) {
+    container.innerHTML = '<p class="muted">No domain information collected.</p>';
+    return;
+  }
+
+  const kvRows = [
+    ['Domain (DNS)', esc(d.dnsRoot)],
+    ['NetBIOS name', esc(d.netBiosName)],
+    ['Distinguished name', '<code>' + esc(d.distinguishedName) + '</code>'],
+    ['Domain SID', '<code>' + esc(d.domainSid) + '</code>'],
+    ['Domain functional level', esc(d.domainMode)],
+    ['Forest', esc(d.forestName)],
+    ['Forest functional level', esc(d.forestMode)]
+  ].map(r => '<tr><td>' + esc(r[0]) + '</td><td>' + r[1] + '</td></tr>').join('');
+
+  const fsmoRows = [
+    ['PDC emulator', esc(d.pdcEmulator)],
+    ['RID master', esc(d.ridMaster)],
+    ['Infrastructure master', esc(d.infrastructureMaster)],
+    ['Schema master', esc(d.schemaMaster)],
+    ['Domain naming master', esc(d.domainNamingMaster)]
+  ].map(r => '<tr><td>' + esc(r[0]) + '</td><td>' + r[1] + '</td></tr>').join('');
+
+  const dcs = d.domainControllers || [];
+  const dcRows = dcs.map(dc =>
+    '<tr>' +
+    '<td style="text-align:left;">' + esc(dc.hostName || dc.name) + '</td>' +
+    '<td>' + esc(dc.ipv4Address) + '</td>' +
+    '<td>' + esc(dc.site) + '</td>' +
+    '<td style="text-align:left;">' + esc(dc.operatingSystem) + (dc.operatingSystemVersion ? ' <span class="muted">(' + esc(dc.operatingSystemVersion) + ')</span>' : '') + '</td>' +
+    '<td>' + (dc.isGlobalCatalog ? 'Yes' : 'No') + '</td>' +
+    '<td>' + (dc.isReadOnly ? 'Yes' : 'No') + '</td>' +
+    '<td style="text-align:left;">' + esc(dc.operationMasterRoles || '') + '</td>' +
+    '</tr>'
+  ).join('');
+
+  container.innerHTML =
+    '<div class="section-block"><h3>Domain</h3><table class="kv-table">' + kvRows + '</table></div>' +
+    '<div class="section-block"><h3>FSMO role holders</h3><table class="kv-table">' + fsmoRows + '</table></div>' +
+    '<div class="section-block"><h3>Domain controllers (' + dcs.length + ')</h3>' +
+    (dcRows
+      ? '<div class="matrix-wrap"><table class="matrix-table"><thead><tr><th>Host</th><th>IPv4</th><th>Site</th><th>Operating system</th><th>GC</th><th>RODC</th><th>FSMO roles</th></tr></thead><tbody>' + dcRows + '</tbody></table></div>'
+      : '<p class="muted">No domain controllers were returned.</p>') +
+    '</div>';
 }
 
 function renderPolicies(filterText, severityFilter) {
@@ -1859,6 +2856,180 @@ function renderScope(filterText, onlyGaps) {
   container.innerHTML = html || '<p class="muted">No OUs match the current filters.</p>';
 }
 
+function membershipCell(m) {
+  if (!m || !m.member) return '<td><span class="check-none">&ndash;</span></td>';
+  if (m.via === 'Direct') return '<td><span class="check-direct" title="Direct member">&#10003;</span></td>';
+  return '<td><span class="check-nested" title="Nested via: ' + esc(m.via) + '">&#10003;</span></td>';
+}
+
+function renderPrivileged() {
+  const container = document.getElementById('privileged-container');
+  const pa = data.privilegedAccess || null;
+
+  if (!pa) {
+    container.innerHTML = '<p class="muted">No privileged access information collected.</p>';
+    return;
+  }
+
+  let html = '';
+
+  // Protected Users x administrative groups matrix
+  html += '<div class="section-block"><h3>Protected Users &#215; administrative groups</h3>';
+  const pu = pa.protectedUsers || {};
+
+  if (!pu.found) {
+    html += '<p class="muted">The Protected Users group could not be resolved: ' + esc(pu.error || 'unknown error') + '</p>';
+  } else if (!pu.users || pu.users.length === 0) {
+    html += '<p class="muted">The Protected Users group has no members. Consider adding highly privileged accounts to it.</p>';
+  } else {
+    const headCols = (pa.groupColumns || []).map(g => '<th>' + esc(g) + '</th>').join('');
+    const rows = pu.users.map(u => {
+      const cells = (pa.groupColumns || []).map(g => membershipCell((u.memberships || {})[g])).join('');
+      const viaTag = (u.via && u.via !== 'Direct')
+        ? ' <span class="tag" title="Member of Protected Users via: ' + esc(u.via) + '">nested</span>'
+        : '';
+      return '<tr><td>' + esc(u.name) +
+        (u.sam ? ' <span class="muted">(' + esc(u.sam) + ')</span>' : '') + viaTag +
+        '</td><td>' + esc(u.objectClass) + '</td>' + cells + '</tr>';
+    }).join('');
+
+    html += '<div class="matrix-wrap"><table class="matrix-table"><thead><tr><th>Protected user</th><th>Type</th>' + headCols + '</tr></thead><tbody>' + rows + '</tbody></table></div>';
+    html += '<p class="muted legend"><span class="check-direct">&#10003;</span> direct member &nbsp;&nbsp; <span class="check-nested">&#10003;</span> member via a nested group (hover for the path) &nbsp;&nbsp; <span class="check-none">&ndash;</span> not a member</p>';
+  }
+  html += '</div>';
+
+  // Recursive privileged group membership
+  html += '<div class="section-block"><h3>Privileged group membership (recursive)</h3>';
+
+  (pa.groups || []).forEach(g => {
+    if (!g.found) {
+      html += '<details class="gpo-block"><summary><span class="gpo-name">' + esc(g.displayName) + '</span>' + badge('unknown', 'Not resolved') + '</summary>' +
+        '<div class="gpo-body"><p class="muted">' + esc(g.error) + '</p></div></details>';
+      return;
+    }
+
+    const countBadge = g.memberCount === 0
+      ? badge('secure', 'Empty')
+      : badge('unknown', g.memberCount + ' member(s)');
+
+    const nestedHtml = (g.nestedGroups && g.nestedGroups.length)
+      ? '<ul>' + g.nestedGroups.map(n =>
+          '<li>' + esc(n.name) +
+          (n.via !== 'Direct' ? ' <span class="muted">(via ' + esc(n.via) + ')</span>' : '') +
+          (n.error ? ' <span class="tag tag-warn" title="' + esc(n.error) + '">not expanded</span>' : '') +
+          '</li>'
+        ).join('') + '</ul>'
+      : '<ul><li class="muted">None</li></ul>';
+
+    const memberRows = (g.members || []).map(m =>
+      '<tr><td>' + esc(m.name) + '</td><td>' + esc(m.sam) + '</td><td>' + esc(m.type) + '</td><td>' + esc(m.via) + '</td></tr>'
+    ).join('');
+
+    const truncNote = g.truncated
+      ? '<p class="muted">Showing the first ' + g.members.length + ' of ' + g.memberCount + ' members; see CSV\\Privileged-Group-Members.csv for the full list.</p>'
+      : '';
+
+    html += '<details class="gpo-block"><summary><span class="gpo-name">' + esc(g.displayName) + '</span>' + countBadge +
+      '<span class="muted"><code>' + esc(g.sid) + '</code></span></summary>' +
+      '<div class="gpo-body">' +
+      '<div class="gpo-columns" style="margin-bottom:14px;">' +
+      '<div><h4>Nested groups</h4>' + nestedHtml + '</div>' +
+      '<div><h4>Resolved group object</h4><ul><li>' + esc(g.groupName) + '</li></ul></div>' +
+      '</div>' +
+      (memberRows
+        ? '<table class="findings-table"><thead><tr><th>Member</th><th>Account</th><th>Type</th><th>Via</th></tr></thead><tbody>' + memberRows + '</tbody></table>'
+        : '<p class="muted">No members.</p>') +
+      truncNote +
+      '</div></details>';
+  });
+
+  html += '</div>';
+  container.innerHTML = html;
+}
+
+function policyValueDays(v) {
+  if (v === 0 || v >= 10000) return 'Not set / never';
+  return v + ' days';
+}
+
+function policyTable(p) {
+  let rows = '';
+
+  const pwRow = (label, valueHtml, badgeHtml) =>
+    '<tr><td>' + esc(label) + '</td><td>' + valueHtml + '</td><td>' + (badgeHtml || '') + '</td></tr>';
+
+  rows += pwRow(
+    'Minimum password length',
+    esc(p.minPasswordLength) + ' characters',
+    p.minPasswordLength >= 14
+      ? badge('secure', 'Meets modern guidance')
+      : (p.minPasswordLength >= 8 ? badge('partial', 'Below 14 characters') : badge('insecure', 'Weak minimum length'))
+  );
+  rows += pwRow(
+    'Password complexity required',
+    p.complexityEnabled ? 'Yes' : 'No',
+    p.complexityEnabled ? badge('secure', 'Enabled') : badge('insecure', 'Disabled')
+  );
+  rows += pwRow(
+    'Password history',
+    esc(p.passwordHistoryCount) + ' passwords remembered',
+    p.passwordHistoryCount >= 24
+      ? badge('secure', '24 or more')
+      : (p.passwordHistoryCount > 0 ? badge('partial', 'Below 24') : badge('insecure', 'No history'))
+  );
+  rows += pwRow('Maximum password age', esc(policyValueDays(p.maxPasswordAgeDays)), badge('unknown', 'Informational'));
+  rows += pwRow('Minimum password age', esc(p.minPasswordAgeDays) + ' days', badge('unknown', 'Informational'));
+  rows += pwRow(
+    'Account lockout threshold',
+    p.lockoutThreshold === 0 ? 'No lockout' : esc(p.lockoutThreshold) + ' invalid attempts',
+    p.lockoutThreshold === 0 ? badge('insecure', 'Lockout disabled') : badge('secure', 'Lockout enabled')
+  );
+  rows += pwRow('Lockout duration', esc(p.lockoutDurationMinutes) + ' minutes', '');
+  rows += pwRow('Lockout observation window', esc(p.lockoutObservationMinutes) + ' minutes', '');
+  rows += pwRow(
+    'Store passwords using reversible encryption',
+    p.reversibleEncryptionEnabled ? 'Yes' : 'No',
+    p.reversibleEncryptionEnabled ? badge('insecure', 'Enabled') : badge('secure', 'Disabled')
+  );
+
+  return '<table class="findings-table"><thead><tr><th>Setting</th><th>Value</th><th>Assessment</th></tr></thead><tbody>' + rows + '</tbody></table>';
+}
+
+function renderPasswordPolicy() {
+  const container = document.getElementById('pwpolicy-container');
+  const pp = data.passwordPolicy || {};
+  let html = '';
+
+  html += '<div class="section-block"><h3>Default domain password policy</h3>';
+  if (pp.defaultPolicy) {
+    html += policyTable(pp.defaultPolicy);
+    html += '<p class="muted">Source: <code>' + esc(pp.defaultPolicy.distinguishedName) + '</code></p>';
+  } else {
+    html += '<p class="muted">Could not be collected: ' + esc(pp.defaultPolicyError || 'unknown error') + '</p>';
+  }
+  html += '</div>';
+
+  html += '<div class="section-block"><h3>Fine-grained password policies (PSOs)</h3>';
+  if (pp.fineGrainedError) {
+    html += '<p class="muted">Could not be enumerated: ' + esc(pp.fineGrainedError) + '</p>';
+  } else if (!pp.fineGrained || pp.fineGrained.length === 0) {
+    html += '<p class="muted">No fine-grained password policies are defined in this domain. The default domain policy applies to all accounts.</p>';
+  } else {
+    pp.fineGrained.forEach(f => {
+      const appliesTo = (f.appliesTo && f.appliesTo.length)
+        ? f.appliesTo.map(a => esc(a)).join(', ')
+        : '<span class="muted">nothing (not linked)</span>';
+
+      html += '<details class="gpo-block"><summary><span class="gpo-name">' + esc(f.name) + '</span>' +
+        '<span class="muted">Precedence ' + esc(f.precedence) + '</span></summary>' +
+        '<div class="gpo-body"><p class="muted">Applies to: ' + appliesTo + '</p>' + policyTable(f) + '</div></details>';
+    });
+  }
+  html += '</div>';
+
+  container.innerHTML = html;
+}
+
 document.querySelectorAll('.tab-btn').forEach(btn => {
   btn.addEventListener('click', () => {
     document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
@@ -1906,8 +3077,11 @@ document.body.addEventListener('mouseout', e => {
 });
 
 renderSummary();
+renderOverview();
 renderPolicies('', 'all');
 renderScope('', false);
+renderPrivileged();
+renderPasswordPolicy();
 </script>
 </body>
 </html>
@@ -1961,6 +3135,12 @@ renderScope('', false);
         }
     )
 
+    $ProtectedUsersSummaryText = "not resolved ($($ProtectedUsersResolution.Error))"
+
+    if ($ProtectedUsersResolution.Found) {
+        $ProtectedUsersSummaryText = "$ProtectedUsersMemberCount member(s)"
+    }
+
     $SummaryLines = New-Object System.Collections.Generic.List[string]
 
     $SummaryLines.Add("GROUP POLICY SECURITY AUDIT EVIDENCE")
@@ -1994,6 +3174,18 @@ renderScope('', false);
     $SummaryLines.Add(
         "GPOs where GptTmpl.inf could not be read from SYSVOL: $($GptTmplAccessErrors.Count)"
     )
+    $SummaryLines.Add(
+        "Domain controllers found                  : $($DomainControllerInventory.Count)"
+    )
+    $SummaryLines.Add(
+        "Protected Users                           : $ProtectedUsersSummaryText"
+    )
+    $SummaryLines.Add(
+        "Privileged groups resolved                : $ResolvedPrivilegedGroupCount of $($PrivilegedGroupDefinitions.Count)"
+    )
+    $SummaryLines.Add(
+        "Fine-grained password policies            : $($FineGrainedPolicyDashboard.Count)"
+    )
     $SummaryLines.Add("")
     $SummaryLines.Add("INTERPRETATION")
     $SummaryLines.Add("--------------")
@@ -2005,6 +3197,9 @@ renderScope('', false);
     )
     $SummaryLines.Add(
         "LmCompatibilityLevel 5 sends NTLMv2 only and refuses inbound LM and NTLMv1."
+    )
+    $SummaryLines.Add(
+        "The Protected Users matrix in the dashboard shows, per Protected Users member, in which administrative groups that account is present (directly or through a nested group)."
     )
     $SummaryLines.Add("")
     $SummaryLines.Add("IMPORTANT SCOPE LIMITATION")
@@ -2025,6 +3220,12 @@ renderScope('', false);
         "GPOs listed in GptTmpl-Access-Errors.csv could not be read from SYSVOL (e.g. delegated ACLs, replication lag); their configured-setting evidence is incomplete, not confirmed absent."
     )
     $SummaryLines.Add(
+        "Privileged groups reported as 'not resolved' could not be located (for example because they do not exist at this functional level, or live in another domain of the forest); treat these as evidence gaps, not as confirmed-empty groups."
+    )
+    $SummaryLines.Add(
+        "Privileged group members with type 'unresolved' are member references that could not be resolved against the selected domain controller (e.g. foreign security principals)."
+    )
+    $SummaryLines.Add(
         "Use gpresult or Resultant Set of Policy for endpoint-specific implementation evidence."
     )
     $SummaryLines.Add("")
@@ -2039,6 +3240,13 @@ renderScope('', false);
     $SummaryLines.Add("CSV\Relevant-GPO-Security-Filtering-Group-Members.csv")
     $SummaryLines.Add("CSV\Relevant-GPO-WMI-Filters.csv")
     $SummaryLines.Add("CSV\Inheritance-Evaluation-Errors.csv")
+    $SummaryLines.Add("CSV\Domain-Information.csv")
+    $SummaryLines.Add("CSV\Domain-Controllers.csv")
+    $SummaryLines.Add("CSV\Password-Policy.csv")
+    $SummaryLines.Add("CSV\Fine-Grained-Password-Policies.csv")
+    $SummaryLines.Add("CSV\Privileged-Group-Members.csv")
+    $SummaryLines.Add("CSV\Privileged-Group-Nested-Groups.csv")
+    $SummaryLines.Add("CSV\Protected-Users-Admin-Matrix.csv")
     $SummaryLines.Add("GPO-Reports-HTML\")
     $SummaryLines.Add("GPO-Reports-XML\")
     $SummaryLines.Add("Raw-GptTmpl-INF\")

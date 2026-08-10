@@ -3598,12 +3598,17 @@ try {
 <title>Active Directory Security Report - __DOMAIN__</title>
 <style>
 :root {
-  --bg: #f7f8fa;
+  --bg: #eef1f6;
   --surface: #ffffff;
-  --border: #e2e5ea;
-  --text: #1a1d23;
+  --surface-2: #f6f7fb;
+  --border: #e5e8ef;
+  --border-strong: #d5dae4;
+  --text: #12141a;
+  --text-2: #3c4250;
   --muted: #6b7280;
-  --accent: #2563eb;
+  --accent: #4f46e5;
+  --accent-2: #6366f1;
+  --accent-soft: #eef2ff;
   --secure: #16a34a;
   --secure-bg: #dcfce7;
   --partial: #b45309;
@@ -3611,18 +3616,29 @@ try {
   --insecure: #dc2626;
   --insecure-bg: #fee2e2;
   --unknown: #6b7280;
-  --unknown-bg: #e5e7eb;
+  --unknown-bg: #e9ecf2;
+  --critical: #b91c1c;
+  --info: #2563eb;
+  --radius: 14px;
+  --radius-sm: 10px;
+  --shadow-sm: 0 1px 2px rgba(17,24,39,.05), 0 1px 3px rgba(17,24,39,.04);
+  --shadow-md: 0 6px 18px rgba(17,24,39,.08);
+  --shadow-lg: 0 18px 40px rgba(17,24,39,.14);
 }
 * { box-sizing: border-box; }
 body {
   margin: 0;
-  font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-  background: var(--bg);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  background: linear-gradient(180deg, #eef1f6 0%, #e8ecf3 100%);
+  background-attachment: fixed;
   color: var(--text);
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
 }
-header { padding: 24px 32px; background: var(--surface); border-bottom: 1px solid var(--border); }
-header h1 { margin: 0 0 4px 0; font-size: 20px; }
-header .meta { color: var(--muted); font-size: 13px; }
+header { padding: 28px 32px 24px; background: linear-gradient(120deg, #1e1b4b 0%, #4338ca 55%, #4f46e5 100%); color: #eef2ff; }
+header h1 { margin: 0 0 6px 0; font-size: 22px; font-weight: 700; letter-spacing: -0.01em; }
+header .meta { color: #c7d2fe; font-size: 13px; }
+header .meta strong { color: #ffffff; font-weight: 600; }
 .summary-cards { display: flex; gap: 12px; padding: 20px 32px 0; flex-wrap: wrap; }
 .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px 18px; min-width: 160px; }
 .card-value { font-size: 26px; font-weight: 700; }
@@ -3630,9 +3646,21 @@ header .meta { color: var(--muted); font-size: 13px; }
 .card-insecure .card-value { color: var(--insecure); }
 .card-partial .card-value { color: var(--partial); }
 .card-secure .card-value { color: var(--secure); }
-.tabs { display: flex; gap: 4px; padding: 20px 32px 0; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
-.tab-btn { border: none; background: none; padding: 10px 16px; cursor: pointer; font-size: 14px; color: var(--muted); border-bottom: 2px solid transparent; }
-.tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
+.tabs {
+  display: flex; gap: 6px; padding: 10px 24px; flex-wrap: wrap;
+  position: sticky; top: 0; z-index: 30;
+  background: rgba(255,255,255,0.82);
+  backdrop-filter: saturate(180%) blur(12px);
+  -webkit-backdrop-filter: saturate(180%) blur(12px);
+  border-bottom: 1px solid var(--border);
+}
+.tab-btn {
+  border: none; background: none; padding: 9px 15px; cursor: pointer;
+  font-size: 13.5px; color: var(--text-2); font-weight: 500;
+  border-radius: 999px; transition: background .15s ease, color .15s ease;
+}
+.tab-btn:hover { background: var(--surface-2); color: var(--text); }
+.tab-btn.active { color: var(--accent); background: var(--accent-soft); font-weight: 600; }
 .tab-panel { display: none; padding: 20px 32px 40px; }
 .tab-panel.active { display: block; }
 .controls { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; flex-wrap: wrap; }
@@ -3684,8 +3712,8 @@ footer { padding: 20px 32px 40px; color: var(--muted); font-size: 12px; border-t
 .member-tooltip .tooltip-muted { color: #9ca3af; }
 .member-tooltip ul.tooltip-list { margin: 0; padding-left: 16px; }
 .member-tooltip .tooltip-type { color: #9ca3af; }
-.section-block { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; margin-bottom: 14px; }
-.section-block h3 { margin: 0 0 12px; font-size: 15px; }
+.section-block { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px 20px; margin-bottom: 16px; box-shadow: var(--shadow-sm); }
+.section-block h3 { margin: 0 0 12px; font-size: 15px; font-weight: 650; }
 .kv-table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .kv-table td { padding: 7px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
 .kv-table td:first-child { color: var(--muted); width: 260px; }
@@ -3707,8 +3735,8 @@ footer { padding: 20px 32px 40px; color: var(--muted); font-size: 12px; border-t
 .sev-info { background: #e0edff; color: var(--accent); }
 .tab-intro { color: var(--muted); font-size: 13px; margin: 0 0 16px; }
 .check-overview { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 10px; margin-bottom: 20px; }
-.check-card { display: block; text-decoration: none; color: inherit; background: var(--surface); border: 1px solid var(--border); border-left: 4px solid var(--border); border-radius: 10px; padding: 12px 14px; }
-.check-card:hover { border-color: var(--accent); }
+.check-card { display: block; text-decoration: none; color: inherit; background: var(--surface); border: 1px solid var(--border); border-left: 4px solid var(--border); border-radius: var(--radius-sm); padding: 12px 14px; box-shadow: var(--shadow-sm); transition: transform .12s ease, box-shadow .15s ease, border-color .15s ease; }
+.check-card:hover { border-color: var(--accent); box-shadow: var(--shadow-md); transform: translateY(-2px); }
 .check-card-value { font-size: 24px; font-weight: 700; }
 .check-card-title { font-size: 12px; color: var(--muted); margin: 2px 0 8px; }
 .check-card.sev-critical { border-left-color: #b91c1c; }
@@ -3717,7 +3745,9 @@ footer { padding: 20px 32px 40px; color: var(--muted); font-size: 12px; border-t
 .check-card.sev-low { border-left-color: var(--unknown); }
 .check-card.sev-info { border-left-color: var(--accent); }
 .check-card.sev-none { opacity: 0.55; }
-.check-block { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; margin-bottom: 10px; overflow: hidden; }
+.check-block { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); margin-bottom: 10px; overflow: hidden; box-shadow: var(--shadow-sm); scroll-margin-top: 84px; transition: box-shadow .15s ease, border-color .15s ease; }
+.check-block:hover { box-shadow: var(--shadow-md); }
+.check-block[open] { border-color: var(--border-strong); }
 .check-block summary { padding: 14px 18px; cursor: pointer; display: flex; gap: 12px; align-items: center; list-style: none; flex-wrap: wrap; }
 .check-block summary::-webkit-details-marker { display: none; }
 .check-name { font-weight: 600; }
@@ -3730,7 +3760,59 @@ footer { padding: 20px 32px 40px; color: var(--muted); font-size: 12px; border-t
 .data-table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .data-table th, .data-table td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border); vertical-align: top; word-break: break-word; }
 .data-table th { font-size: 12px; color: var(--muted); white-space: nowrap; }
-@media (max-width: 720px) { .gpo-columns { grid-template-columns: 1fr; } }
+.ov-h { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 26px 0 12px; font-weight: 650; }
+.ov-hero {
+  display: flex; justify-content: space-between; gap: 24px; flex-wrap: wrap;
+  border-radius: 18px; padding: 26px 28px; margin-bottom: 18px; color: #fff;
+  box-shadow: var(--shadow-lg);
+  background: linear-gradient(120deg, #334155 0%, #475569 100%);
+}
+.ov-hero.ov-critical { background: linear-gradient(120deg, #7f1d1d 0%, #b91c1c 100%); }
+.ov-hero.ov-high { background: linear-gradient(120deg, #9a3412 0%, #dc2626 100%); }
+.ov-hero.ov-medium { background: linear-gradient(120deg, #92400e 0%, #d97706 100%); }
+.ov-hero.ov-low { background: linear-gradient(120deg, #3730a3 0%, #4f46e5 100%); }
+.ov-hero.ov-good { background: linear-gradient(120deg, #065f46 0%, #16a34a 100%); }
+.ov-hero-eyebrow { text-transform: uppercase; letter-spacing: .08em; font-size: 11px; opacity: .82; font-weight: 600; }
+.ov-hero-title { font-size: 25px; font-weight: 750; margin: 10px 0 6px; letter-spacing: -0.015em; }
+.ov-hero-sub { font-size: 14px; opacity: .92; }
+.ov-hero-meta { display: grid; gap: 12px; align-content: center; min-width: 210px; }
+.ov-hero-meta > div { display: flex; flex-direction: column; }
+.ov-hero-meta-k { font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; opacity: .75; }
+.ov-hero-meta-v { font-size: 14px; font-weight: 600; }
+.ov-sevrow { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 14px; }
+.ov-sev { background: var(--surface); border: 1px solid var(--border); border-top: 3px solid var(--border-strong); border-radius: var(--radius); padding: 16px 18px; box-shadow: var(--shadow-sm); }
+.ov-sev-top { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; color: var(--text-2); }
+.ov-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); display: inline-block; }
+.ov-sev-num { font-size: 34px; font-weight: 750; line-height: 1.1; margin: 8px 0 2px; letter-spacing: -0.02em; }
+.ov-sev-sub { font-size: 12px; color: var(--muted); }
+.ov-sev.ov-empty { opacity: .58; }
+.ov-critical { border-top-color: var(--critical); }
+.ov-critical .ov-dot { background: var(--critical); }
+.ov-critical .ov-sev-num { color: var(--critical); }
+.ov-high { border-top-color: var(--insecure); }
+.ov-high .ov-dot { background: var(--insecure); }
+.ov-high .ov-sev-num { color: var(--insecure); }
+.ov-medium { border-top-color: var(--partial); }
+.ov-medium .ov-dot { background: var(--partial); }
+.ov-medium .ov-sev-num { color: var(--partial); }
+.ov-low { border-top-color: var(--muted); }
+.ov-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(168px, 1fr)); gap: 14px; }
+.ov-metric { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px 18px; box-shadow: var(--shadow-sm); }
+.ov-metric-val { font-size: 26px; font-weight: 750; letter-spacing: -0.02em; }
+.ov-metric-lbl { font-size: 13px; color: var(--text-2); font-weight: 550; margin-top: 2px; }
+.ov-metric-sub { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+.ov-metric.ov-bad .ov-metric-val { color: var(--insecure); }
+.ov-metric.ov-warn .ov-metric-val { color: var(--partial); }
+.ov-metric.ov-ok .ov-metric-val { color: var(--secure); }
+.ov-priorities { display: flex; flex-direction: column; gap: 8px; }
+.ov-priority { display: flex; align-items: center; gap: 12px; text-decoration: none; color: inherit; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 12px 16px; box-shadow: var(--shadow-sm); transition: transform .12s ease, box-shadow .15s ease, border-color .15s ease; }
+.ov-priority:hover { border-color: var(--accent); box-shadow: var(--shadow-md); transform: translateX(2px); }
+.ov-priority-title { font-weight: 600; font-size: 14px; }
+.ov-priority-cat { font-size: 11px; color: var(--muted); background: var(--surface-2); border: 1px solid var(--border); border-radius: 999px; padding: 1px 9px; }
+.ov-priority-count { margin-left: auto; font-weight: 700; font-size: 15px; }
+.ov-priority-arrow { color: var(--muted); font-size: 22px; line-height: 1; }
+.ov-allclear { background: var(--secure-bg); color: #14532d; border: 1px solid #bbf7d0; border-radius: var(--radius); padding: 16px 18px; font-size: 14px; }
+@media (max-width: 720px) { .gpo-columns { grid-template-columns: 1fr; } .ov-hero { flex-direction: column; } }
 </style>
 </head>
 <body>
@@ -3742,19 +3824,22 @@ footer { padding: 20px 32px 40px; color: var(--muted); font-size: 12px; border-t
   <div class="meta">Domain: <strong>__DOMAIN__</strong> &middot; Domain controller: <strong>__DC__</strong> &middot; Generated: __GENERATED_AT__</div>
 </header>
 
-<section class="summary-cards" id="summary-cards"></section>
-
 <nav class="tabs">
-  <button class="tab-btn active" data-tab="overview">Domain overview</button>
+  <button class="tab-btn active" data-tab="dashboard">Overview</button>
   <button class="tab-btn" data-tab="users">Users</button>
   <button class="tab-btn" data-tab="computers">Computers</button>
   <button class="tab-btn" data-tab="privileged">Privileged access</button>
   <button class="tab-btn" data-tab="pwpolicy">Password policy</button>
+  <button class="tab-btn" data-tab="domain">Domain</button>
   <button class="tab-btn" data-tab="policies">Group Policy</button>
   <button class="tab-btn" data-tab="scope">GPO scope by OU</button>
 </nav>
 
-<section id="tab-overview" class="tab-panel active">
+<section id="tab-dashboard" class="tab-panel active">
+  <div id="dashboard-container"></div>
+</section>
+
+<section id="tab-domain" class="tab-panel">
   <div id="overview-container"></div>
 </section>
 
@@ -4213,6 +4298,107 @@ function renderAccountChecks(category, containerId, intro) {
   container.innerHTML = html;
 }
 
+function renderDashboard() {
+  const container = document.getElementById('dashboard-container');
+  const checks = data.accountChecks || [];
+  const s = data.summary || {};
+  const di = data.domainInfo || {};
+  const rank = { Critical: 0, High: 1, Medium: 2, Low: 3, Info: 4 };
+  const sevClass = { Critical: 'critical', High: 'high', Medium: 'medium', Low: 'low' };
+
+  const sev = {
+    Critical: { checks: 0, objects: 0 },
+    High: { checks: 0, objects: 0 },
+    Medium: { checks: 0, objects: 0 },
+    Low: { checks: 0, objects: 0 }
+  };
+  checks.forEach(k => {
+    if (k.count > 0 && sev[k.severity]) {
+      sev[k.severity].checks++;
+      sev[k.severity].objects += k.count;
+    }
+  });
+
+  const totalFlagged = sev.Critical.checks + sev.High.checks + sev.Medium.checks + sev.Low.checks;
+  let vCls, vTitle;
+  if (sev.Critical.checks) { vCls = 'critical'; vTitle = 'Critical issues require immediate attention'; }
+  else if (sev.High.checks) { vCls = 'high'; vTitle = 'High-risk issues found'; }
+  else if (sev.Medium.checks) { vCls = 'medium'; vTitle = 'Some medium-risk issues to review'; }
+  else if (sev.Low.checks) { vCls = 'low'; vTitle = 'Only minor cleanup items remain'; }
+  else { vCls = 'good'; vTitle = 'No account or computer issues flagged'; }
+  const vSub = totalFlagged
+    ? (totalFlagged + ' check' + (totalFlagged === 1 ? '' : 's') + ' flagged across the Users and Computers tabs')
+    : 'All user and computer security checks passed';
+
+  const fl = di.domainMode ? esc(di.domainMode) : '&ndash;';
+
+  let html = '';
+
+  html += '<div class="ov-hero ov-' + vCls + '">' +
+    '<div class="ov-hero-main">' +
+      '<div class="ov-hero-eyebrow">Security posture</div>' +
+      '<div class="ov-hero-title">' + esc(vTitle) + '</div>' +
+      '<div class="ov-hero-sub">' + esc(vSub) + '</div>' +
+    '</div>' +
+    '<div class="ov-hero-meta">' +
+      '<div><span class="ov-hero-meta-k">Domain</span><span class="ov-hero-meta-v">' + esc(data.domain || di.dnsRoot || '') + '</span></div>' +
+      '<div><span class="ov-hero-meta-k">Functional level</span><span class="ov-hero-meta-v">' + fl + '</span></div>' +
+      '<div><span class="ov-hero-meta-k">Generated</span><span class="ov-hero-meta-v">' + esc(data.generatedAt || '') + '</span></div>' +
+    '</div>' +
+  '</div>';
+
+  html += '<div class="ov-h">Findings by severity</div><div class="ov-sevrow">';
+  ['Critical', 'High', 'Medium', 'Low'].forEach(k => {
+    const d = sev[k];
+    html += '<div class="ov-sev ov-' + sevClass[k] + (d.checks ? '' : ' ov-empty') + '">' +
+      '<div class="ov-sev-top"><span class="ov-dot"></span>' + k + '</div>' +
+      '<div class="ov-sev-num">' + d.checks + '</div>' +
+      '<div class="ov-sev-sub">' + (d.checks ? (d.objects + ' object' + (d.objects === 1 ? '' : 's') + ' affected') : 'None') + '</div>' +
+    '</div>';
+  });
+  html += '</div>';
+
+  const priv = (data.privilegedAccess && data.privilegedAccess.privilegedUsers && data.privilegedAccess.privilegedUsers.users) || [];
+  const protectedCount = priv.filter(u => u.protected && u.protected.member).length;
+  const privCheck = checks.find(k => k.key === 'privileged-accounts');
+  const metric = (value, label, sub, tone) =>
+    '<div class="ov-metric' + (tone ? (' ov-' + tone) : '') + '">' +
+    '<div class="ov-metric-val">' + value + '</div>' +
+    '<div class="ov-metric-lbl">' + esc(label) + '</div>' +
+    (sub ? ('<div class="ov-metric-sub">' + esc(sub) + '</div>') : '') + '</div>';
+
+  html += '<div class="ov-h">Environment</div><div class="ov-metrics">';
+  html += metric(s.domainControllerCount != null ? s.domainControllerCount : '&ndash;', 'Domain controllers', null, null);
+  html += metric(privCheck ? privCheck.count : '&ndash;', 'Privileged accounts', 'core admin groups', null);
+  html += metric(priv.length ? (protectedCount + ' / ' + priv.length) : '&ndash;', 'In Protected Users', 'of privileged accounts', (priv.length && protectedCount < priv.length) ? 'warn' : (priv.length ? 'ok' : null));
+  html += metric(s.findingsInsecure != null ? s.findingsInsecure : '&ndash;', 'Insecure GPO findings', 'SMB / NTLM policy', (s.findingsInsecure > 0 ? 'bad' : 'ok'));
+  html += metric(s.protectedUsersMembers != null ? s.protectedUsersMembers : '&ndash;', 'Protected Users members', null, null);
+  html += '</div>';
+
+  const flagged = checks.filter(k => k.count > 0 && k.severity !== 'Info')
+    .sort((a, b) => (rank[a.severity] - rank[b.severity]) || (b.count - a.count));
+
+  html += '<div class="ov-h">Top priorities</div>';
+  if (!flagged.length) {
+    html += '<div class="ov-allclear">Nothing needs attention right now. Every individual check is still available on the Users and Computers tabs.</div>';
+  } else {
+    html += '<div class="ov-priorities">';
+    flagged.forEach(k => {
+      const tab = k.category === 'Users' ? 'users' : 'computers';
+      html += '<a class="ov-priority" data-jump data-tab="' + tab + '" data-check="' + esc(k.key) + '">' +
+        sevBadge(k.severity) +
+        '<span class="ov-priority-title">' + esc(k.title) + '</span>' +
+        '<span class="ov-priority-cat">' + esc(k.category) + '</span>' +
+        '<span class="ov-priority-count">' + k.count + '</span>' +
+        '<span class="ov-priority-arrow">&rsaquo;</span>' +
+      '</a>';
+    });
+    html += '</div>';
+  }
+
+  container.innerHTML = html;
+}
+
 function policyValueDays(v) {
   if (v === 0 || v >= 10000) return 'Not set / never';
   return v + ' days';
@@ -4296,14 +4482,24 @@ function renderPasswordPolicy() {
   container.innerHTML = html;
 }
 
+function activateTab(name) {
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+  const panel = document.getElementById('tab-' + name);
+  if (panel) panel.classList.add('active');
+}
+
 document.querySelectorAll('.tab-btn').forEach(btn => {
-  btn.addEventListener('click', () => {
-    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-    document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
-    btn.classList.add('active');
-    document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
-  });
+  btn.addEventListener('click', () => activateTab(btn.dataset.tab));
 });
+
+function openCheck(key) {
+  const detail = document.getElementById('check-' + key);
+  if (detail) {
+    detail.open = true;
+    detail.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+}
 
 const policySearch = document.getElementById('policy-search');
 const severityFilter = document.getElementById('severity-filter');
@@ -4342,19 +4538,23 @@ document.body.addEventListener('mouseout', e => {
   tooltip.style.display = 'none';
 });
 
-// Clicking a quick-overview card opens and scrolls to its detail section.
+// A quick-overview card opens its detail in the current tab; an Overview
+// "top priority" jumps to the relevant tab first, then opens the detail.
 document.body.addEventListener('click', e => {
+  const jump = e.target.closest('[data-jump]');
+  if (jump) {
+    e.preventDefault();
+    activateTab(jump.dataset.tab);
+    window.requestAnimationFrame(() => openCheck(jump.dataset.check));
+    return;
+  }
   const card = e.target.closest('.check-card');
   if (!card) return;
   e.preventDefault();
-  const detail = document.getElementById('check-' + card.dataset.check);
-  if (detail) {
-    detail.open = true;
-    detail.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  }
+  openCheck(card.dataset.check);
 });
 
-renderSummary();
+renderDashboard();
 renderOverview();
 renderAccountChecks('Users', 'users-container', 'User-account security checks. Each card is a check; click it to jump to the details, evidence table and recommendation. Full results are written to one CSV per check.');
 renderAccountChecks('Computers', 'computers-container', 'Computer-account security checks. Each card is a check; click it to jump to the details, evidence table and recommendation. Full results are written to one CSV per check.');

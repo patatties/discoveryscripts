@@ -14,8 +14,10 @@
     In addition, the script collects:
     - Domain information and a full domain controller inventory
       (shown on the dashboard "Domain overview" cover tab)
-    - Protected Users membership, cross-referenced against the
-      administrative groups in the domain (checkmark matrix per user)
+    - A cumulative privileged-account inventory: every account that is a
+      member of any administrative group or of Protected Users, cross-
+      referenced against those groups and against the Protected Users
+      group (checkmark matrix per account)
     - Recursive privileged group membership, including groups that are
       nested inside privileged groups (with the nesting path recorded)
     - The default domain password policy and any fine-grained password
@@ -50,7 +52,8 @@
     - WMI filter information
     - Domain information and domain controller inventory
     - Recursive privileged group membership (including nested groups)
-    - A Protected Users x administrative groups matrix
+    - A cumulative privileged-account x administrative groups matrix,
+      including Protected Users membership status
     - Default and fine-grained password policy evidence
     - A record of OUs/domain containers where inheritance could not be
       evaluated, even after retries
@@ -1846,10 +1849,11 @@ try {
     # nesting path so a reviewer can see through which intermediate group
     # a member was reached.
     #
-    # The dashboard's "Privileged access" tab shows every member of the
-    # built-in Protected Users group, with one column per administrative
-    # group and a checkmark when the user is (directly or via nesting) a
-    # member of that group.
+    # The dashboard's "Privileged access" tab shows a cumulative inventory
+    # of every account that is (directly or via nesting) a member of any
+    # administrative group or of the built-in Protected Users group, with
+    # one column per administrative group and a final column indicating
+    # whether the account is in Protected Users.
     #######################################################################
 
     Write-AuditLog "Collecting privileged group and Protected Users membership."
@@ -1877,7 +1881,7 @@ try {
     }
 
     # Column/definition order below is also the column order of the
-    # Protected Users matrix in the dashboard and CSV.
+    # privileged-account inventory in the dashboard and CSV.
     $PrivilegedGroupDefinitions = New-Object System.Collections.Generic.List[object]
 
     $PrivilegedGroupDefinitions.Add(
@@ -2050,65 +2054,148 @@ try {
         $AdminMembershipLookup[$PrivilegedGroup.DisplayName] = $MembershipLookup
     }
 
-    $ProtectedUserMatrix = New-Object System.Collections.Generic.List[object]
-    $ProtectedUsersMatrixCsvRows = New-Object System.Collections.Generic.List[object]
+    #######################################################################
+    # Build a Protected Users membership lookup (member DN -> nesting path)
+    # so protection status can be shown as a column on the cumulative
+    # privileged-account inventory below.
+    #######################################################################
+
+    $ProtectedUsersLookup = @{}
 
     if ($ProtectedUsersResolution.Found) {
-        foreach ($ProtectedUser in @($ProtectedUsersResolution.Members)) {
-            $Memberships = [ordered]@{}
-
-            $CsvRow = [ordered]@{
-                UserName          = $ProtectedUser.Name
-                SamAccountName    = $ProtectedUser.SamAccountName
-                ObjectType        = $ProtectedUser.ObjectClass
-                ProtectedUsersVia = $ProtectedUser.Via
+        foreach ($ProtectedMember in @($ProtectedUsersResolution.Members)) {
+            if (-not $ProtectedUsersLookup.ContainsKey($ProtectedMember.Dn)) {
+                $ProtectedUsersLookup[$ProtectedMember.Dn] = [string]$ProtectedMember.Via
             }
-
-            foreach ($MatrixGroupName in $MatrixGroupNames) {
-                $MembershipLookup = $AdminMembershipLookup[$MatrixGroupName]
-
-                if ($MembershipLookup.ContainsKey($ProtectedUser.Dn)) {
-                    $Via = [string]$MembershipLookup[$ProtectedUser.Dn]
-
-                    $Memberships[$MatrixGroupName] = [PSCustomObject]@{
-                        member = $true
-                        via    = $Via
-                    }
-
-                    if ($Via -eq "Direct") {
-                        $CsvRow[$MatrixGroupName] = "Yes (direct)"
-                    }
-                    else {
-                        $CsvRow[$MatrixGroupName] = "Yes (via $Via)"
-                    }
-                }
-                else {
-                    $Memberships[$MatrixGroupName] = [PSCustomObject]@{
-                        member = $false
-                        via    = ""
-                    }
-
-                    $CsvRow[$MatrixGroupName] = "No"
-                }
-            }
-
-            $ProtectedUserMatrix.Add(
-                [PSCustomObject]@{
-                    name        = $ProtectedUser.Name
-                    sam         = $ProtectedUser.SamAccountName
-                    objectClass = $ProtectedUser.ObjectClass
-                    via         = $ProtectedUser.Via
-                    memberships = $Memberships
-                }
-            )
-
-            $ProtectedUsersMatrixCsvRows.Add([PSCustomObject]$CsvRow)
         }
     }
 
-    $ProtectedUsersMatrixCsvRows |
+    #######################################################################
+    # Build the cumulative privileged-account inventory: the de-duplicated
+    # union of every member of every administrative group and of the
+    # Protected Users group, with one column per administrative group and a
+    # final "in Protected Users" column. Protected Users is treated as one
+    # of the groups, so an account that is only in Protected Users is still
+    # listed (with empty administrative-group columns).
+    #######################################################################
+
+    $PrivilegedUserInfo = @{}
+
+    foreach ($PrivilegedGroup in $PrivilegedGroupResults) {
+        if (-not $PrivilegedGroup.Resolution.Found) {
+            continue
+        }
+
+        foreach ($Member in @($PrivilegedGroup.Resolution.Members)) {
+            if (-not $PrivilegedUserInfo.ContainsKey($Member.Dn)) {
+                $PrivilegedUserInfo[$Member.Dn] = $Member
+            }
+        }
+    }
+
+    if ($ProtectedUsersResolution.Found) {
+        foreach ($ProtectedMember in @($ProtectedUsersResolution.Members)) {
+            if (-not $PrivilegedUserInfo.ContainsKey($ProtectedMember.Dn)) {
+                $PrivilegedUserInfo[$ProtectedMember.Dn] = $ProtectedMember
+            }
+        }
+    }
+
+    $PrivilegedUserMatrix = New-Object System.Collections.Generic.List[object]
+    $PrivilegedUserMatrixCsvRows = New-Object System.Collections.Generic.List[object]
+
+    foreach ($PrivilegedUser in @($PrivilegedUserInfo.Values | Sort-Object Name)) {
+        $Memberships = [ordered]@{}
+
+        $CsvRow = [ordered]@{
+            UserName       = $PrivilegedUser.Name
+            SamAccountName = $PrivilegedUser.SamAccountName
+            ObjectType     = $PrivilegedUser.ObjectClass
+        }
+
+        foreach ($MatrixGroupName in $MatrixGroupNames) {
+            $MembershipLookup = $AdminMembershipLookup[$MatrixGroupName]
+
+            if ($MembershipLookup.ContainsKey($PrivilegedUser.Dn)) {
+                $Via = [string]$MembershipLookup[$PrivilegedUser.Dn]
+
+                $Memberships[$MatrixGroupName] = [PSCustomObject]@{
+                    member = $true
+                    via    = $Via
+                }
+
+                if ($Via -eq "Direct") {
+                    $CsvRow[$MatrixGroupName] = "Yes (direct)"
+                }
+                else {
+                    $CsvRow[$MatrixGroupName] = "Yes (via $Via)"
+                }
+            }
+            else {
+                $Memberships[$MatrixGroupName] = [PSCustomObject]@{
+                    member = $false
+                    via    = ""
+                }
+
+                $CsvRow[$MatrixGroupName] = "No"
+            }
+        }
+
+        #######################################################################
+        # Protection status (final "Protected Users" column)
+        #######################################################################
+
+        if (-not $ProtectedUsersResolution.Found) {
+            $ProtectedCell = [PSCustomObject]@{
+                member   = $false
+                via      = ""
+                resolved = $false
+            }
+
+            $CsvRow["ProtectedUsers"] = "Unknown (group not resolved)"
+        }
+        elseif ($ProtectedUsersLookup.ContainsKey($PrivilegedUser.Dn)) {
+            $ProtectedVia = [string]$ProtectedUsersLookup[$PrivilegedUser.Dn]
+
+            $ProtectedCell = [PSCustomObject]@{
+                member   = $true
+                via      = $ProtectedVia
+                resolved = $true
+            }
+
+            if ($ProtectedVia -eq "Direct") {
+                $CsvRow["ProtectedUsers"] = "Yes (direct)"
+            }
+            else {
+                $CsvRow["ProtectedUsers"] = "Yes (via $ProtectedVia)"
+            }
+        }
+        else {
+            $ProtectedCell = [PSCustomObject]@{
+                member   = $false
+                via      = ""
+                resolved = $true
+            }
+
+            $CsvRow["ProtectedUsers"] = "No"
+        }
+
+        $PrivilegedUserMatrix.Add(
+            [PSCustomObject]@{
+                name        = $PrivilegedUser.Name
+                sam         = $PrivilegedUser.SamAccountName
+                objectClass = $PrivilegedUser.ObjectClass
+                memberships = $Memberships
+                protected   = $ProtectedCell
+            }
+        )
+
+        $PrivilegedUserMatrixCsvRows.Add([PSCustomObject]$CsvRow)
+    }
+
+    $PrivilegedUserMatrixCsvRows |
         Export-Csv `
-            -Path (Join-Path $Directories.Csv "Protected-Users-Admin-Matrix.csv") `
+            -Path (Join-Path $Directories.Csv "Privileged-Account-Membership-Matrix.csv") `
             -NoTypeInformation `
             -Encoding UTF8
 
@@ -2406,6 +2493,46 @@ try {
         }
     )
 
+    # Add Protected Users to the privileged group list so it is presented
+    # like the other administrative groups. Its members also drive the
+    # "Protected Users" column on the privileged-account inventory above.
+    $ProtectedUsersAllMembers = @($ProtectedUsersResolution.Members)
+
+    $ProtectedUsersGroupEntry = [PSCustomObject]@{
+        displayName  = "Protected Users"
+        found        = [bool]$ProtectedUsersResolution.Found
+        error        = $ProtectedUsersResolution.Error
+        groupName    = $ProtectedUsersResolution.GroupName
+        sid          = $ProtectedUsersResolution.GroupSid
+        memberCount  = $ProtectedUsersAllMembers.Count
+        truncated    = ($ProtectedUsersAllMembers.Count -gt $MaxGroupMembersToDisplay)
+        nestedGroups = @(
+            $ProtectedUsersResolution.NestedGroups |
+            ForEach-Object {
+                [PSCustomObject]@{
+                    name     = $_.Name
+                    via      = $_.Via
+                    expanded = $_.Expanded
+                    error    = $_.Error
+                }
+            }
+        )
+        members      = @(
+            $ProtectedUsersAllMembers |
+            Select-Object -First $MaxGroupMembersToDisplay |
+            ForEach-Object {
+                [PSCustomObject]@{
+                    name = $_.Name
+                    sam  = $_.SamAccountName
+                    type = $_.ObjectClass
+                    via  = $_.Via
+                }
+            }
+        )
+    }
+
+    $DashboardPrivilegedGroups = @($DashboardPrivilegedGroups) + @($ProtectedUsersGroupEntry)
+
     # Normalize generic lists before JSON serialization. This avoids a
     # Windows PowerShell 5.1 binder issue involving List[object] values.
     $DashboardGposArray = $DashboardGpos.ToArray()
@@ -2437,14 +2564,17 @@ try {
             fineGrainedError   = $FineGrainedPolicyError
         }
         privilegedAccess = [PSCustomObject]@{
-            groupColumns   = @($MatrixGroupNames.ToArray())
-            groups         = $DashboardPrivilegedGroups
-            protectedUsers = [PSCustomObject]@{
+            groupColumns    = @($MatrixGroupNames.ToArray())
+            groups          = $DashboardPrivilegedGroups
+            protectedUsers  = [PSCustomObject]@{
                 found       = [bool]$ProtectedUsersResolution.Found
                 error       = $ProtectedUsersResolution.Error
                 groupName   = $ProtectedUsersResolution.GroupName
                 memberCount = $ProtectedUsersMemberCount
-                users       = @($ProtectedUserMatrix.ToArray())
+            }
+            privilegedUsers = [PSCustomObject]@{
+                protectedResolved = [bool]$ProtectedUsersResolution.Found
+                users             = @($PrivilegedUserMatrix.ToArray())
             }
         }
         gpos             = $DashboardGposArray
@@ -2565,6 +2695,7 @@ footer { padding: 20px 32px 40px; color: var(--muted); font-size: 12px; border-t
 .check-direct { color: var(--secure); font-weight: 700; font-size: 15px; }
 .check-nested { color: var(--partial); font-weight: 700; font-size: 15px; border-bottom: 1px dotted var(--partial); cursor: help; }
 .check-none { color: #cbd5e1; }
+.not-protected { color: var(--partial); font-weight: 700; font-size: 15px; border-bottom: 1px dotted var(--partial); cursor: help; }
 .legend { margin: 10px 0 0; }
 @media (max-width: 720px) { .gpo-columns { grid-template-columns: 1fr; } }
 </style>
@@ -2868,6 +2999,19 @@ function membershipCell(m) {
   return '<td><span class="check-nested" title="Nested via: ' + esc(m.via) + '">&#10003;</span></td>';
 }
 
+function protectedCell(p) {
+  if (!p || p.resolved === false) {
+    return '<td><span class="check-none" title="Protected Users group could not be resolved">?</span></td>';
+  }
+  if (p.member) {
+    if (p.via && p.via !== 'Direct') {
+      return '<td><span class="check-nested" title="In Protected Users via: ' + esc(p.via) + '">&#10003;</span></td>';
+    }
+    return '<td><span class="check-direct" title="In Protected Users">&#10003;</span></td>';
+  }
+  return '<td><span class="not-protected" title="Not a member of Protected Users">&#10007;</span></td>';
+}
+
 function renderPrivileged() {
   const container = document.getElementById('privileged-container');
   const pa = data.privilegedAccess || null;
@@ -2879,28 +3023,43 @@ function renderPrivileged() {
 
   let html = '';
 
-  // Protected Users x administrative groups matrix
-  html += '<div class="section-block"><h3>Protected Users &#215; administrative groups</h3>';
-  const pu = pa.protectedUsers || {};
+  // Cumulative privileged-account inventory: every account that is a member
+  // (directly or through nesting) of any administrative group, with a column
+  // per group and a final Protected Users column.
+  html += '<div class="section-block"><h3>Privileged &amp; protected accounts</h3>';
+  html += '<p class="muted">Every account that is a member &ndash; directly or through a nested group &ndash; of at least one administrative group or of Protected Users, showing the groups it belongs to and whether it is protected.</p>';
 
-  if (!pu.found) {
-    html += '<p class="muted">The Protected Users group could not be resolved: ' + esc(pu.error || 'unknown error') + '</p>';
-  } else if (!pu.users || pu.users.length === 0) {
-    html += '<p class="muted">The Protected Users group has no members. Consider adding highly privileged accounts to it.</p>';
+  const columns = pa.groupColumns || [];
+  const pinv = pa.privilegedUsers || {};
+  const users = pinv.users || [];
+
+  if (users.length === 0) {
+    html += '<p class="muted">No members were resolved in any administrative group or in Protected Users.</p>';
   } else {
-    const headCols = (pa.groupColumns || []).map(g => '<th>' + esc(g) + '</th>').join('');
-    const rows = pu.users.map(u => {
-      const cells = (pa.groupColumns || []).map(g => membershipCell((u.memberships || {})[g])).join('');
-      const viaTag = (u.via && u.via !== 'Direct')
-        ? ' <span class="tag" title="Member of Protected Users via: ' + esc(u.via) + '">nested</span>'
-        : '';
+    const protectedResolved = pinv.protectedResolved !== false;
+    if (protectedResolved) {
+      const protectedCount = users.filter(u => u.protected && u.protected.member).length;
+      html += '<p class="muted">' + protectedCount + ' of ' + users.length +
+        ' account(s) are in Protected Users.</p>';
+    } else {
+      html += '<p class="muted">Protected Users could not be resolved, so protection status is unknown for these accounts.</p>';
+    }
+
+    const headCols = columns.map(g => '<th>' + esc(g) + '</th>').join('');
+    const rows = users.map(u => {
+      const cells = columns.map(g => membershipCell((u.memberships || {})[g])).join('');
       return '<tr><td>' + esc(u.name) +
-        (u.sam ? ' <span class="muted">(' + esc(u.sam) + ')</span>' : '') + viaTag +
-        '</td><td>' + esc(u.objectClass) + '</td>' + cells + '</tr>';
+        (u.sam ? ' <span class="muted">(' + esc(u.sam) + ')</span>' : '') +
+        '</td><td>' + esc(u.objectClass) + '</td>' + cells +
+        protectedCell(u.protected) + '</tr>';
     }).join('');
 
-    html += '<div class="matrix-wrap"><table class="matrix-table"><thead><tr><th>Protected user</th><th>Type</th>' + headCols + '</tr></thead><tbody>' + rows + '</tbody></table></div>';
-    html += '<p class="muted legend"><span class="check-direct">&#10003;</span> direct member &nbsp;&nbsp; <span class="check-nested">&#10003;</span> member via a nested group (hover for the path) &nbsp;&nbsp; <span class="check-none">&ndash;</span> not a member</p>';
+    html += '<div class="matrix-wrap"><table class="matrix-table"><thead><tr><th>Account</th><th>Type</th>' +
+      headCols + '<th>Protected Users</th></tr></thead><tbody>' + rows + '</tbody></table></div>';
+    html += '<p class="muted legend"><span class="check-direct">&#10003;</span> direct member &nbsp;&nbsp; ' +
+      '<span class="check-nested">&#10003;</span> member via a nested group (hover for the path) &nbsp;&nbsp; ' +
+      '<span class="check-none">&ndash;</span> not a member &nbsp;&nbsp; ' +
+      '<span class="not-protected">&#10007;</span> not in Protected Users</p>';
   }
   html += '</div>';
 
@@ -3205,7 +3364,7 @@ renderPasswordPolicy();
         "LmCompatibilityLevel 5 sends NTLMv2 only and refuses inbound LM and NTLMv1."
     )
     $SummaryLines.Add(
-        "The Protected Users matrix in the dashboard shows, per Protected Users member, in which administrative groups that account is present (directly or through a nested group)."
+        "The privileged-accounts inventory in the dashboard lists every account that is a member (directly or through a nested group) of any administrative group, with a column per group and whether the account is in Protected Users."
     )
     $SummaryLines.Add("")
     $SummaryLines.Add("IMPORTANT SCOPE LIMITATION")
@@ -3252,7 +3411,7 @@ renderPasswordPolicy();
     $SummaryLines.Add("CSV\Fine-Grained-Password-Policies.csv")
     $SummaryLines.Add("CSV\Privileged-Group-Members.csv")
     $SummaryLines.Add("CSV\Privileged-Group-Nested-Groups.csv")
-    $SummaryLines.Add("CSV\Protected-Users-Admin-Matrix.csv")
+    $SummaryLines.Add("CSV\Privileged-Account-Membership-Matrix.csv")
     $SummaryLines.Add("GPO-Reports-HTML\")
     $SummaryLines.Add("GPO-Reports-XML\")
     $SummaryLines.Add("Raw-GptTmpl-INF\")

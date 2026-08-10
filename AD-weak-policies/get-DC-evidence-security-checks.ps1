@@ -802,15 +802,16 @@ function Get-AdMultiValue {
 
     $Value = Get-AdProp -Object $Object -Name $Name
 
-    # The unary comma prevents PowerShell from unwrapping the array on
-    # return. Without it, an empty array is emitted as nothing and the
-    # caller receives $null (so $result.Count throws under Set-StrictMode),
-    # and a single value is unwrapped to a scalar.
+    # PowerShell unwraps an empty array on return (the caller then receives
+    # $null) and unwraps a single value to a scalar. Callers therefore wrap
+    # every call in @(...) so the result is always a real array with a
+    # .Count member under Set-StrictMode; returning plain values here keeps
+    # that contract simple and unambiguous.
     if ($null -eq $Value) {
-        return , @()
+        return @()
     }
 
-    return , @($Value)
+    return @($Value)
 }
 
 function Get-YesNo {
@@ -2617,6 +2618,7 @@ try {
     #######################################################################
 
     foreach ($User in $AllUsers) {
+      try {
         $UserName         = [string]$User.Name
         $UserSam          = [string]$User.SamAccountName
         $UserEnabled      = [bool]$User.Enabled
@@ -2624,13 +2626,13 @@ try {
         $UserDn           = [string]$User.DistinguishedName
         $UserPwdLastSet   = Get-AdProp -Object $User -Name "PasswordLastSet"
         $UserPwdNever     = [bool](Get-AdProp -Object $User -Name "PasswordNeverExpires")
-        $UserSpns         = Get-AdMultiValue -Object $User -Name "ServicePrincipalName"
+        $UserSpns         = @(Get-AdMultiValue -Object $User -Name "ServicePrincipalName")
         $UserNoPreauth    = [bool](Get-AdProp -Object $User -Name "DoesNotRequirePreAuth")
         $UserUnconstr     = [bool](Get-AdProp -Object $User -Name "TrustedForDelegation")
         $UserProtocolTr   = [bool](Get-AdProp -Object $User -Name "TrustedToAuthForDelegation")
-        $UserDelegateTo   = Get-AdMultiValue -Object $User -Name "msDS-AllowedToDelegateTo"
+        $UserDelegateTo   = @(Get-AdMultiValue -Object $User -Name "msDS-AllowedToDelegateTo")
         $UserAdminCount   = Get-AdProp -Object $User -Name "AdminCount"
-        $UserSidHistory   = Get-AdMultiValue -Object $User -Name "SIDHistory"
+        $UserSidHistory   = @(Get-AdMultiValue -Object $User -Name "SIDHistory")
         $UserLastLogon    = Get-AdProp -Object $User -Name "LastLogonDate"
         $UserNotDelegated = [bool](Get-AdProp -Object $User -Name "AccountNotDelegated")
         $UserDesOnly      = [bool](Get-AdProp -Object $User -Name "UseDESKeyOnly")
@@ -2768,6 +2770,12 @@ try {
                 name = $UserName; sam = $UserSam; enabled = $UserEnabledText
             })
         }
+      }
+      catch {
+        Write-AuditLog `
+            -Level "WARNING" `
+            -Message ("Skipped user '{0}': {1}" -f ([string]$User.SamAccountName), $_.Exception.Message)
+      }
     }
 
     #######################################################################
@@ -2775,6 +2783,7 @@ try {
     #######################################################################
 
     foreach ($Computer in $AllComputers) {
+      try {
         $CompName        = [string]$Computer.Name
         $CompSam         = [string]$Computer.SamAccountName
         $CompEnabled     = [bool]$Computer.Enabled
@@ -2783,9 +2792,9 @@ try {
         $CompLastLogon   = Get-AdProp -Object $Computer -Name "LastLogonDate"
         $CompUnconstr    = [bool](Get-AdProp -Object $Computer -Name "TrustedForDelegation")
         $CompProtocolTr  = [bool](Get-AdProp -Object $Computer -Name "TrustedToAuthForDelegation")
-        $CompDelegateTo  = Get-AdMultiValue -Object $Computer -Name "msDS-AllowedToDelegateTo"
+        $CompDelegateTo  = @(Get-AdMultiValue -Object $Computer -Name "msDS-AllowedToDelegateTo")
         $CompRbcd        = Get-AdProp -Object $Computer -Name "msDS-AllowedToActOnBehalfOfOtherIdentity"
-        $CompSidHistory  = Get-AdMultiValue -Object $Computer -Name "SIDHistory"
+        $CompSidHistory  = @(Get-AdMultiValue -Object $Computer -Name "SIDHistory")
         $CompDesOnly     = [bool](Get-AdProp -Object $Computer -Name "UseDESKeyOnly")
         $CompEnc = Get-KerberosEncryptionInfo `
             -EncryptionTypes (Get-AdProp -Object $Computer -Name "msDS-SupportedEncryptionTypes") `
@@ -2899,6 +2908,12 @@ try {
                 })
             }
         }
+      }
+      catch {
+        Write-AuditLog `
+            -Level "WARNING" `
+            -Message ("Skipped computer '{0}': {1}" -f ([string]$Computer.SamAccountName), $_.Exception.Message)
+      }
     }
 
     #######################################################################

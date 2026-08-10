@@ -802,11 +802,15 @@ function Get-AdMultiValue {
 
     $Value = Get-AdProp -Object $Object -Name $Name
 
+    # The unary comma prevents PowerShell from unwrapping the array on
+    # return. Without it, an empty array is emitted as nothing and the
+    # caller receives $null (so $result.Count throws under Set-StrictMode),
+    # and a single value is unwrapped to a scalar.
     if ($null -eq $Value) {
-        return @()
+        return , @()
     }
 
-    return @($Value)
+    return , @($Value)
 }
 
 function Get-YesNo {

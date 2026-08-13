@@ -814,6 +814,39 @@ function Get-AdMultiValue {
     return @($Value)
 }
 
+function Get-AccountGroupRefs {
+    <#
+        Resolves a set of "MemberOf" distinguished names to display-ready
+        group references ({name; sid}) using a pre-built DN -> group
+        lookup, so this can be called per-user/-computer/-group without
+        any additional AD query. DNs that cannot be resolved (for example
+        a group in another domain of the forest) are silently skipped;
+        this feeds an informational hover feature, not evidence, so a
+        best-effort result is preferable to failing the whole account.
+    #>
+    param (
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$MemberOfDns,
+
+        [Parameter(Mandatory)]
+        [hashtable]$GroupDnLookup
+    )
+
+    $Refs = New-Object System.Collections.Generic.List[object]
+
+    foreach ($Dn in $MemberOfDns) {
+        $DnString = [string]$Dn
+
+        if ($GroupDnLookup.ContainsKey($DnString)) {
+            $Ref = $GroupDnLookup[$DnString]
+            $Refs.Add([PSCustomObject]@{ name = $Ref.Name; sid = $Ref.Sid })
+        }
+    }
+
+    return @($Refs.ToArray() | Sort-Object name)
+}
+
 function Get-YesNo {
     param (
         [Parameter()]
@@ -1167,6 +1200,12 @@ try {
     $RelevantGpoIds = New-Object System.Collections.Generic.HashSet[string]
     $GptTmplAccessErrors = New-Object System.Collections.Generic.List[object]
 
+    # GPO ID -> path (relative to the dashboard file) of that GPO's full,
+    # native HTML report. Populated for every GPO below so the dashboard
+    # can link straight to the complete report (every configured setting,
+    # not just the tracked SMB/NTLM subset) instead of re-parsing it.
+    $GpoReportPaths = @{}
+
     #######################################################################
     # Inspect every GPO
     #######################################################################
@@ -1185,6 +1224,8 @@ try {
         $HtmlReportPath = Join-Path `
             $Directories.GpoHtml `
             ($ReportBaseName + ".html")
+
+        $GpoReportPaths[$GpoGuid] = "GPO-Reports-HTML/$ReportBaseName.html"
 
         Get-GPOReport `
             -Guid $Gpo.Id `
@@ -2546,7 +2587,7 @@ try {
         "ServicePrincipalName", "DoesNotRequirePreAuth", "TrustedForDelegation",
         "TrustedToAuthForDelegation", "msDS-AllowedToDelegateTo", "AdminCount",
         "SIDHistory", "msDS-SupportedEncryptionTypes", "LastLogonDate",
-        "AccountNotDelegated", "UseDESKeyOnly"
+        "AccountNotDelegated", "UseDESKeyOnly", "MemberOf"
     )
 
     $AllUsers = @(
@@ -2559,7 +2600,7 @@ try {
         "LastLogonDate", "PasswordLastSet", "TrustedForDelegation",
         "TrustedToAuthForDelegation", "msDS-AllowedToDelegateTo",
         "msDS-AllowedToActOnBehalfOfOtherIdentity", "msDS-SupportedEncryptionTypes",
-        "SIDHistory", "PrimaryGroupID", "UseDESKeyOnly"
+        "SIDHistory", "PrimaryGroupID", "UseDESKeyOnly", "MemberOf"
     ) + $LapsExpirationAttributes
 
     $AllComputers = @(
@@ -2571,6 +2612,70 @@ try {
     foreach ($DcRow in $DomainControllerInventory) {
         if (-not [string]::IsNullOrWhiteSpace($DcRow.Name)) {
             $DomainControllerHostNames[[string]$DcRow.Name] = $true
+        }
+    }
+
+    #######################################################################
+    # Build group membership lookups for the Users/Computers hover feature
+    #
+    # Reuses data already being pulled (every user's and computer's
+    # MemberOf, read above) plus one additional bulk group query, instead
+    # of calling Get-ADGroupMember per group. This gives direct membership
+    # in both directions - account -> groups, and group -> members (users,
+    # computers, and nested groups) - at effectively no extra AD query
+    # cost. Membership here is direct only, same semantics as the
+    # existing security-filtering group hover.
+    #######################################################################
+
+    Write-AuditLog "Resolving group membership for the Users/Computers hover feature."
+
+    $AllGroupsForHover = @(
+        Get-ADGroup -Filter * -Server $DomainController -Properties SamAccountName, MemberOf
+    )
+
+    $GroupDnLookup = @{}
+    foreach ($GroupForHover in $AllGroupsForHover) {
+        $GroupDnLookup[[string]$GroupForHover.DistinguishedName] = [PSCustomObject]@{
+            Name = [string]$GroupForHover.Name
+            Sid  = [string]$GroupForHover.SID.Value
+        }
+    }
+
+    # sam/name -> array of {name, sid} group references, for the "hover a
+    # user/computer, see its groups" direction. Users are keyed by
+    # SamAccountName (matches the "sam" field on every Users-tab row);
+    # computers are keyed by Name, since Computers-tab rows carry a "name"
+    # field (the computer's Name, i.e. its SamAccountName without the
+    # trailing "$") rather than a SamAccountName column.
+    $AccountGroupsBySam = @{}
+
+    # group SID -> list of {name, type} direct members, for the "hover a
+    # group, see its members" direction. Merged into $GroupMembershipCache
+    # below so it reuses the existing hover-tooltip mechanism.
+    $GroupDirectMembersBySid = @{}
+
+    foreach ($GroupForHover in $AllGroupsForHover) {
+        $GroupOwnName = [string]$GroupForHover.Name
+        $GroupParentDns = @(Get-AdMultiValue -Object $GroupForHover -Name "MemberOf")
+
+        foreach ($ParentGroupDn in $GroupParentDns) {
+            if (-not $GroupDnLookup.ContainsKey($ParentGroupDn)) {
+                continue
+            }
+
+            $ParentGroupRef = $GroupDnLookup[$ParentGroupDn]
+
+            if ([string]::IsNullOrWhiteSpace($ParentGroupRef.Sid)) {
+                continue
+            }
+
+            if (-not $GroupDirectMembersBySid.ContainsKey($ParentGroupRef.Sid)) {
+                $GroupDirectMembersBySid[$ParentGroupRef.Sid] = New-Object System.Collections.Generic.List[object]
+            }
+
+            $GroupDirectMembersBySid[$ParentGroupRef.Sid].Add(
+                [PSCustomObject]@{ name = $GroupOwnName; type = "group" }
+            )
         }
     }
 
@@ -2645,6 +2750,28 @@ try {
             -EncryptionTypes (Get-AdProp -Object $User -Name "msDS-SupportedEncryptionTypes") `
             -UseDesKeyOnly $UserDesOnly
         $UserIsPrivileged = $AdminMemberDnSet.ContainsKey($UserDn)
+
+        $UserGroupRefs = Get-AccountGroupRefs `
+            -MemberOfDns (Get-AdMultiValue -Object $User -Name "MemberOf") `
+            -GroupDnLookup $GroupDnLookup
+
+        if ($UserGroupRefs.Count -gt 0) {
+            $AccountGroupsBySam[$UserSam] = $UserGroupRefs
+        }
+
+        foreach ($UserGroupRef in $UserGroupRefs) {
+            if ([string]::IsNullOrWhiteSpace($UserGroupRef.sid)) {
+                continue
+            }
+
+            if (-not $GroupDirectMembersBySid.ContainsKey($UserGroupRef.sid)) {
+                $GroupDirectMembersBySid[$UserGroupRef.sid] = New-Object System.Collections.Generic.List[object]
+            }
+
+            $GroupDirectMembersBySid[$UserGroupRef.sid].Add(
+                [PSCustomObject]@{ name = $UserName; type = "user" }
+            )
+        }
 
         $UserPwdAgeDays = ""
         if ($null -ne $UserPwdLastSet) {
@@ -2811,6 +2938,34 @@ try {
             $DomainControllerHostNames.ContainsKey($CompName)
         )
 
+        $CompGroupRefs = Get-AccountGroupRefs `
+            -MemberOfDns (Get-AdMultiValue -Object $Computer -Name "MemberOf") `
+            -GroupDnLookup $GroupDnLookup
+
+        if ($CompGroupRefs.Count -gt 0) {
+            # Indexed under both the computer's Name (used by most
+            # Computers-tab check rows) and its raw SamAccountName
+            # including the trailing "$" (used by the mixed users+computers
+            # delegation-overview check), so the Groups column resolves
+            # regardless of which field a given check's rows carry.
+            $AccountGroupsBySam[$CompName] = $CompGroupRefs
+            $AccountGroupsBySam[$CompSam] = $CompGroupRefs
+        }
+
+        foreach ($CompGroupRef in $CompGroupRefs) {
+            if ([string]::IsNullOrWhiteSpace($CompGroupRef.sid)) {
+                continue
+            }
+
+            if (-not $GroupDirectMembersBySid.ContainsKey($CompGroupRef.sid)) {
+                $GroupDirectMembersBySid[$CompGroupRef.sid] = New-Object System.Collections.Generic.List[object]
+            }
+
+            $GroupDirectMembersBySid[$CompGroupRef.sid].Add(
+                [PSCustomObject]@{ name = $CompName; type = "computer" }
+            )
+        }
+
         if ($CompUnconstr) {
             $CompUnconstrainedRows.Add([PSCustomObject]@{
                 name = $CompName
@@ -2919,6 +3074,30 @@ try {
             -Level "WARNING" `
             -Message ("Skipped computer '{0}': {1}" -f ([string]$Computer.SamAccountName), $_.Exception.Message)
       }
+    }
+
+    #######################################################################
+    # Merge the derived group -> members lookup into the existing
+    # security-filtering group membership cache, so the dashboard's hover
+    # tooltip mechanism (data.groupMembers) also covers hovering over any
+    # group shown on the Users/Computers tabs. Groups already resolved via
+    # Get-ADGroupMember above are left as-is.
+    #######################################################################
+
+    foreach ($HoverGroupSid in $GroupDirectMembersBySid.Keys) {
+        if ($GroupMembershipCache.ContainsKey($HoverGroupSid)) {
+            continue
+        }
+
+        $HoverMembersAll = @($GroupDirectMembersBySid[$HoverGroupSid].ToArray() | Sort-Object name)
+
+        $GroupMembershipCache[$HoverGroupSid] = [PSCustomObject]@{
+            resolved   = $true
+            totalCount = $HoverMembersAll.Count
+            members    = @($HoverMembersAll | Select-Object -First $MaxGroupMembersToDisplay)
+            truncated  = ($HoverMembersAll.Count -gt $MaxGroupMembersToDisplay)
+            error      = ""
+        }
     }
 
     #######################################################################
@@ -3369,12 +3548,19 @@ try {
             }
         }
 
+        $GpoReportRelativePath = ""
+        if ($GpoReportPaths.ContainsKey($GpoGuid)) {
+            $GpoReportRelativePath = $GpoReportPaths[$GpoGuid]
+        }
+
         $DashboardGpos.Add(
             [PSCustomObject]@{
                 gpoId             = $GpoGuid
                 gpoName           = $Gpo.DisplayName
                 gpoStatus         = [string]$Gpo.GpoStatus
+                creationTime      = [string]$Gpo.CreationTime
                 modificationTime  = [string]$Gpo.ModificationTime
+                htmlReportPath    = $GpoReportRelativePath
                 findings          = @($GpoFindings.ToArray())
                 directLinks       = $GpoDirectLinks
                 structuralScope   = $GpoScope
@@ -3614,6 +3800,7 @@ try {
         gpos             = $DashboardGposArray
         scopeTargets     = $DashboardScopeTargetsArray
         groupMembers     = $GroupMembershipCache
+        accountGroups    = $AccountGroupsBySam
     }
 
     $DashboardJson = $DashboardData | ConvertTo-Json -Depth 20
@@ -3939,16 +4126,24 @@ footer { padding: 20px 32px 40px; color: var(--muted); font-size: 12px; border-t
   endpoint-specific proof. Rows marked "Evaluation failed" could not be checked at all (even after retries) and
   are gaps in this evidence set, not confirmed absence of a policy.
   <br /><br />
-  The Group Policy tab lists every GPO in the domain. The checklist on each GPO shows every setting this tool
-  tracks (currently SMB signing and the LAN Manager authentication level): a green, checked chip means the GPO
-  explicitly configures that setting, a grey, unchecked chip means it does not. The table below the checklist
-  drills into the configured settings only, together with the GPO's structural scope and security filtering.
-  The "Relevant-GPO-*.csv" evidence files still cover only the subset of GPOs that configure a tracked setting.
+  The Group Policy tab lists every GPO in the domain, expanded by default. The checklist on each GPO shows every
+  setting this tool tracks (currently SMB signing and the LAN Manager authentication level): a green, checked chip
+  means the GPO explicitly configures that setting, a grey, unchecked chip means it does not. The table below the
+  checklist drills into the configured settings only, together with the GPO's direct links, structural scope and
+  security filtering. "Open full GPO report" links to that GPO's complete native report (every configured setting,
+  not just the tracked subset). The "Relevant-GPO-*.csv" evidence files still cover only the subset of GPOs that
+  configure a tracked setting.
+  <br /><br />
+  On the Users and Computers tabs, every row has a "Groups" column: hover over a group name to see its members
+  (users, computers and nested groups), the same way group names are hoverable elsewhere in this report. Group
+  membership shown this way is direct only (not resolved through nesting) and, like the privileged-group hover,
+  is capped at the configured maximum with the full list available in evidence where applicable.
 </footer>
 
 <script>
 const data = __DASHBOARD_JSON__;
 const groupMembers = data.groupMembers || {};
+const accountGroups = data.accountGroups || {};
 const tooltip = document.getElementById('member-tooltip');
 
 function esc(s) {
@@ -4117,6 +4312,15 @@ function renderPolicies(filterText, severityFilter) {
         ).join('') + '</tbody></table>'
       : '<p class="muted">No settings from the tracked catalog are explicitly configured in this GPO.</p>';
 
+    const directLinksHtml = gpo.directLinks.length
+      ? gpo.directLinks.map(l =>
+          '<li><code>' + esc(l.target) + '</code>' +
+          (l.enforced === 'True' ? ' <span class="tag">enforced</span>' : '') +
+          (l.enabled === 'False' ? ' <span class="tag tag-warn">link disabled</span>' : '') +
+          '</li>'
+        ).join('')
+      : '<li class="muted">No direct links found</li>';
+
     const scopeHtml = gpo.structuralScope.length
       ? gpo.structuralScope.map(s =>
           '<li><code>' + esc(s.target) + '</code>' +
@@ -4137,12 +4341,19 @@ function renderPolicies(filterText, severityFilter) {
       ? '<div><strong>WMI filter:</strong> ' + esc(gpo.wmiFilter.name) + '</div>'
       : '';
 
+    const metaHtml = '<div class="muted" style="margin:-6px 0 14px;">Created ' + esc(gpo.creationTime || 'unknown') +
+      ' &middot; Modified ' + esc(gpo.modificationTime || 'unknown') +
+      (gpo.htmlReportPath ? ' &middot; <a href="' + esc(gpo.htmlReportPath) + '" target="_blank" rel="noopener">Open full GPO report (every configured setting) &#8599;</a>' : '') +
+      '</div>';
+
     html +=
       '<details class="gpo-block" open><summary><span class="gpo-name">' + esc(gpo.gpoName) + '</span><span class="gpo-status muted">' + esc(gpo.gpoStatus) + '</span></summary>' +
       '<div class="gpo-body">' +
+      metaHtml +
       '<div class="gpo-checklist">' + checklistHtml + '</div>' +
       findingsHtml +
       '<div class="gpo-columns">' +
+      '<div><h4>Direct links</h4><ul>' + directLinksHtml + '</ul></div>' +
       '<div><h4>Applies at (structural scope)</h4><ul>' + scopeHtml + '</ul></div>' +
       '<div><h4>Security filtering (Apply permission)</h4><ul>' + filteringHtml + '</ul></div>' +
       '</div>' + wmiHtml +
@@ -4322,13 +4533,27 @@ function sevBadge(sev) {
   return '<span class="sev sev-' + esc(s.toLowerCase()) + '">' + esc(s) + '</span>';
 }
 
+function accountGroupsCell(row) {
+  // Users-tab rows carry "sam" (SamAccountName); Computers-tab rows carry
+  // "name" (the computer's Name, i.e. its SamAccountName without the
+  // trailing "$") instead - accountGroups is keyed to match whichever one
+  // a given check's rows actually have. Checks whose rows carry neither
+  // (e.g. the domain-controllers check, keyed by "host") simply show a dash.
+  const key = row.sam || row.name;
+  const groups = key ? (accountGroups[key] || []) : [];
+  if (!groups.length) return '<td><span class="check-none">&ndash;</span></td>';
+  return '<td>' + groups.map(g =>
+    g.sid ? trusteeSpan(g.sid, g.name, 'trustee-chip') : '<span class="trustee-chip">' + esc(g.name) + '</span>'
+  ).join('') + '</td>';
+}
+
 function renderCheckTable(check) {
   if (!check.rows || check.rows.length === 0) {
     return '<p class="muted">No matching objects found.</p>';
   }
-  const head = check.columns.map(c => '<th>' + esc(c.label) + '</th>').join('');
+  const head = check.columns.map(c => '<th>' + esc(c.label) + '</th>').join('') + '<th>Groups</th>';
   const body = check.rows.map(r =>
-    '<tr>' + check.columns.map(c => '<td>' + esc(r[c.key]) + '</td>').join('') + '</tr>'
+    '<tr>' + check.columns.map(c => '<td>' + esc(r[c.key]) + '</td>').join('') + accountGroupsCell(r) + '</tr>'
   ).join('');
   let t = '<div class="table-wrap"><table class="data-table"><thead><tr>' + head + '</tr></thead><tbody>' + body + '</tbody></table></div>';
   if (check.truncated) {

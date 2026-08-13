@@ -3722,6 +3722,8 @@ footer { padding: 20px 32px 40px; color: var(--muted); font-size: 12px; border-t
 .matrix-table th, .matrix-table td { padding: 8px 10px; border-bottom: 1px solid var(--border); text-align: center; white-space: nowrap; }
 .matrix-table th:first-child, .matrix-table td:first-child { text-align: left; position: sticky; left: 0; background: var(--surface); }
 .matrix-table th { font-size: 12px; }
+.priv-matrix th:first-child, .priv-matrix td:first-child { text-align: center; }
+.priv-matrix th:nth-child(2), .priv-matrix td:nth-child(2) { text-align: left; }
 .check-direct { color: var(--secure); font-weight: 700; font-size: 15px; }
 .check-nested { color: var(--partial); font-weight: 700; font-size: 15px; border-bottom: 1px dotted var(--partial); cursor: help; }
 .check-none { color: #cbd5e1; }
@@ -4126,7 +4128,7 @@ function renderScope(filterText, onlyGaps) {
 function membershipCell(m) {
   if (!m || !m.member) return '<td><span class="check-none">&ndash;</span></td>';
   if (m.via === 'Direct') return '<td><span class="check-direct" title="Direct member">&#10003;</span></td>';
-  return '<td><span class="check-nested" title="Nested via: ' + esc(m.via) + '">&#10003;</span></td>';
+  return '<td><span class="check-nested" title="Nested via: ' + esc(m.via) + '">&#8618;</span></td>';
 }
 
 function protectedCell(p) {
@@ -4135,7 +4137,7 @@ function protectedCell(p) {
   }
   if (p.member) {
     if (p.via && p.via !== 'Direct') {
-      return '<td><span class="check-nested" title="In Protected Users via: ' + esc(p.via) + '">&#10003;</span></td>';
+      return '<td><span class="check-nested" title="In Protected Users via: ' + esc(p.via) + '">&#8618;</span></td>';
     }
     return '<td><span class="check-direct" title="In Protected Users">&#10003;</span></td>';
   }
@@ -4178,16 +4180,16 @@ function renderPrivileged() {
     const headCols = columns.map(g => '<th>' + esc(g) + '</th>').join('');
     const rows = users.map(u => {
       const cells = columns.map(g => membershipCell((u.memberships || {})[g])).join('');
-      return '<tr><td>' + esc(u.name) +
+      return '<tr>' + protectedCell(u.protected) +
+        '<td>' + esc(u.name) +
         (u.sam ? ' <span class="muted">(' + esc(u.sam) + ')</span>' : '') +
-        '</td><td>' + esc(u.objectClass) + '</td>' + cells +
-        protectedCell(u.protected) + '</tr>';
+        '</td><td>' + esc(u.objectClass) + '</td>' + cells + '</tr>';
     }).join('');
 
-    html += '<div class="matrix-wrap"><table class="matrix-table"><thead><tr><th>Account</th><th>Type</th>' +
-      headCols + '<th>Protected Users</th></tr></thead><tbody>' + rows + '</tbody></table></div>';
+    html += '<div class="matrix-wrap"><table class="matrix-table priv-matrix"><thead><tr><th>Protected Users</th><th>Account</th><th>Type</th>' +
+      headCols + '</tr></thead><tbody>' + rows + '</tbody></table></div>';
     html += '<p class="muted legend"><span class="check-direct">&#10003;</span> direct member &nbsp;&nbsp; ' +
-      '<span class="check-nested">&#10003;</span> member via a nested group (hover for the path) &nbsp;&nbsp; ' +
+      '<span class="check-nested">&#8618;</span> member via a nested group (hover for the path) &nbsp;&nbsp; ' +
       '<span class="check-none">&ndash;</span> not a member &nbsp;&nbsp; ' +
       '<span class="not-protected">&#10007;</span> not in Protected Users</p>';
   }

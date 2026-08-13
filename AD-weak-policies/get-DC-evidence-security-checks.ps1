@@ -826,12 +826,21 @@ function Get-AccountGroupRefs {
     #>
     param (
         [Parameter(Mandatory)]
+        [AllowNull()]
         [AllowEmptyCollection()]
         [object[]]$MemberOfDns,
 
         [Parameter(Mandatory)]
         [hashtable]$GroupDnLookup
     )
+
+    # An account with no group memberships at all has MemberOf collapse to
+    # $null by the time it reaches here (PowerShell enumerates an empty
+    # array onto the pipeline as zero objects), even with -AllowNull -
+    # normalize instead of requiring every caller to guard against it.
+    if ($null -eq $MemberOfDns) {
+        $MemberOfDns = @()
+    }
 
     $Refs = New-Object System.Collections.Generic.List[object]
 
@@ -2751,9 +2760,11 @@ try {
             -UseDesKeyOnly $UserDesOnly
         $UserIsPrivileged = $AdminMemberDnSet.ContainsKey($UserDn)
 
-        $UserGroupRefs = Get-AccountGroupRefs `
-            -MemberOfDns (Get-AdMultiValue -Object $User -Name "MemberOf") `
-            -GroupDnLookup $GroupDnLookup
+        $UserGroupRefs = @(
+            Get-AccountGroupRefs `
+                -MemberOfDns @(Get-AdMultiValue -Object $User -Name "MemberOf") `
+                -GroupDnLookup $GroupDnLookup
+        )
 
         if ($UserGroupRefs.Count -gt 0) {
             $AccountGroupsBySam[$UserSam] = $UserGroupRefs
@@ -2938,9 +2949,11 @@ try {
             $DomainControllerHostNames.ContainsKey($CompName)
         )
 
-        $CompGroupRefs = Get-AccountGroupRefs `
-            -MemberOfDns (Get-AdMultiValue -Object $Computer -Name "MemberOf") `
-            -GroupDnLookup $GroupDnLookup
+        $CompGroupRefs = @(
+            Get-AccountGroupRefs `
+                -MemberOfDns @(Get-AdMultiValue -Object $Computer -Name "MemberOf") `
+                -GroupDnLookup $GroupDnLookup
+        )
 
         if ($CompGroupRefs.Count -gt 0) {
             # Indexed under both the computer's Name (used by most

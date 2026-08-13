@@ -1380,14 +1380,14 @@ try {
     # than localized Group Policy display text.
     #######################################################################
 
+    # Collected for every GPO (not just the ones with a tracked SMB/NTLM
+    # setting configured) so the dashboard can show direct links for the
+    # full GPO inventory. The "Relevant-GPO-*.csv" evidence files below stay
+    # scoped to the tracked-setting subset, as their name promises.
     $DirectLinkResults = New-Object System.Collections.Generic.List[object]
 
     foreach ($Gpo in $Gpos) {
         $GpoGuid = $Gpo.Id.ToString()
-
-        if (-not $RelevantGpoIds.Contains($GpoGuid)) {
-            continue
-        }
 
         $SafeGpoName = New-SafeFileName -Name $Gpo.DisplayName
         $ReportBaseName = "{0}--{1}" -f $SafeGpoName, $GpoGuid
@@ -1447,6 +1447,7 @@ try {
     }
 
     $DirectLinkResults |
+        Where-Object { $RelevantGpoIds.Contains($_.GpoId) } |
         Sort-Object GpoName, LinkTarget |
         Export-Csv `
             -Path (Join-Path $Directories.Csv "Relevant-GPO-Direct-Links.csv") `
@@ -1603,10 +1604,11 @@ try {
 
                     $InheritedGpoGuid = $InheritedLink.GpoId.ToString()
 
-                    if (-not $RelevantGpoIds.Contains($InheritedGpoGuid)) {
-                        continue
-                    }
-
+                    # Recorded for every linked GPO (Get-GPInheritance already
+                    # returns the full set of InheritedGpoLinks for this
+                    # target regardless, so this costs no extra AD query) so
+                    # the dashboard can show structural scope for the full
+                    # GPO inventory, not just the tracked-setting subset.
                     $StructuralScopeResults.Add(
                         [PSCustomObject]@{
                             ScopeTarget          = $ScopeTarget
@@ -1657,6 +1659,7 @@ try {
     }
 
     $StructuralScopeResults |
+        Where-Object { $RelevantGpoIds.Contains($_.GpoId) } |
         Sort-Object GpoName, ScopeTarget |
         Export-Csv `
             -Path (Join-Path $Directories.Csv "Relevant-GPO-Structural-Scope.csv") `
@@ -1684,14 +1687,13 @@ try {
     # Collect GPO permissions and security filtering evidence
     #######################################################################
 
+    # Collected for every GPO, not just the tracked-setting subset, so the
+    # dashboard can show security filtering (and, via group membership
+    # resolution below, who it resolves to) for the full GPO inventory.
     $PermissionResults = New-Object System.Collections.Generic.List[object]
 
     foreach ($Gpo in $Gpos) {
         $GpoGuid = $Gpo.Id.ToString()
-
-        if (-not $RelevantGpoIds.Contains($GpoGuid)) {
-            continue
-        }
 
         $Permissions = @(
             Get-GPPermission `
@@ -1721,6 +1723,7 @@ try {
     }
 
     $PermissionResults |
+        Where-Object { $RelevantGpoIds.Contains($_.GpoId) } |
         Sort-Object GpoName, Permission, TrusteeName |
         Export-Csv `
             -Path (Join-Path $Directories.Csv "Relevant-GPO-Permissions.csv") `
@@ -1853,14 +1856,11 @@ try {
     # Collect WMI filter evidence
     #######################################################################
 
+    # Collected for every GPO, not just the tracked-setting subset.
     $WmiFilterResults = New-Object System.Collections.Generic.List[object]
 
     foreach ($Gpo in $Gpos) {
         $GpoGuid = $Gpo.Id.ToString()
-
-        if (-not $RelevantGpoIds.Contains($GpoGuid)) {
-            continue
-        }
 
         $WmiFilterName = ""
         $WmiFilterPath = ""
@@ -1893,6 +1893,7 @@ try {
     }
 
     $WmiFilterResults |
+        Where-Object { $RelevantGpoIds.Contains($_.GpoId) } |
         Sort-Object GpoName |
         Export-Csv `
             -Path (Join-Path $Directories.Csv "Relevant-GPO-WMI-Filters.csv") `
@@ -3252,6 +3253,7 @@ try {
             interpretation = $PolicyResult.Interpretation
             clientBehavior = $PolicyResult.ClientBehavior
             serverBehavior = $PolicyResult.ServerBehavior
+            configured     = $true
         }
 
         if (-not $FindingsByGpoId.ContainsKey($PolicyResult.GpoId)) {
@@ -3286,13 +3288,43 @@ try {
     foreach ($Gpo in $Gpos) {
         $GpoGuid = $Gpo.Id.ToString()
 
-        if (-not $RelevantGpoIds.Contains($GpoGuid)) {
-            continue
+        $GpoConfiguredFindings = @()
+        if ($FindingsByGpoId.ContainsKey($GpoGuid)) {
+            $GpoConfiguredFindings = $FindingsByGpoId[$GpoGuid].ToArray()
         }
 
-        $GpoFindings = @()
-        if ($FindingsByGpoId.ContainsKey($GpoGuid)) {
-            $GpoFindings = $FindingsByGpoId[$GpoGuid].ToArray()
+        # Every GPO gets one row per entry in $PolicyTargets - the full
+        # catalog of settings this script tracks - not just the ones it
+        # actually configures. This is what lets the dashboard show, for
+        # every GPO, which of the tracked settings it COULD contain and
+        # whether it actually does, instead of only listing GPOs/settings
+        # that happen to be configured.
+        $GpoFindings = New-Object System.Collections.Generic.List[object]
+        foreach ($Target in $PolicyTargets) {
+            $ExistingFinding = $GpoConfiguredFindings |
+                Where-Object { $_.category -eq $Target.Category -and $_.setting -eq $Target.Setting } |
+                Select-Object -First 1
+
+            if ($ExistingFinding) {
+                $GpoFindings.Add($ExistingFinding)
+            }
+            else {
+                $GpoFindings.Add(
+                    [PSCustomObject]@{
+                        category       = $Target.Category
+                        setting        = $Target.Setting
+                        registryPath   = $Target.RegistryPath
+                        valueName      = $Target.ValueName
+                        registryData   = ""
+                        severity       = "not-configured"
+                        label          = "Not configured"
+                        interpretation = "This GPO does not explicitly configure this setting."
+                        clientBehavior = ""
+                        serverBehavior = ""
+                        configured     = $false
+                    }
+                )
+            }
         }
 
         $GpoDirectLinks = @(
@@ -3343,7 +3375,7 @@ try {
                 gpoName           = $Gpo.DisplayName
                 gpoStatus         = [string]$Gpo.GpoStatus
                 modificationTime  = [string]$Gpo.ModificationTime
-                findings          = $GpoFindings
+                findings          = @($GpoFindings.ToArray())
                 directLinks       = $GpoDirectLinks
                 structuralScope   = $GpoScope
                 securityFiltering = $GpoFiltering
@@ -3672,6 +3704,7 @@ header .meta strong { color: #ffffff; font-weight: 600; }
 .badge-partial { background: var(--partial-bg); color: var(--partial); }
 .badge-insecure { background: var(--insecure-bg); color: var(--insecure); }
 .badge-unknown { background: var(--unknown-bg); color: var(--unknown); }
+.badge-not-configured { background: var(--border); color: var(--muted); }
 .gpo-block, .scope-block { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; margin-bottom: 10px; overflow: hidden; }
 .gpo-block summary { padding: 14px 18px; cursor: pointer; display: flex; gap: 12px; align-items: center; list-style: none; flex-wrap: wrap; }
 .gpo-block summary::-webkit-details-marker { display: none; }
@@ -3682,6 +3715,11 @@ header .meta strong { color: #ffffff; font-weight: 600; }
 .gpo-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
 .gpo-columns h4 { margin: 0 0 6px; font-size: 12px; text-transform: uppercase; color: var(--muted); }
 .gpo-columns ul { margin: 0; padding-left: 18px; font-size: 13px; }
+.gpo-checklist { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 14px; }
+.check-chip { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px 4px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; border: 1px solid var(--border); cursor: help; }
+.check-chip .chip-mark { font-size: 12px; line-height: 1; }
+.check-chip.is-set { background: var(--secure-bg); color: var(--secure); border-color: var(--secure); }
+.check-chip.is-unset { background: var(--surface-2); color: var(--muted); border-color: var(--border); font-weight: 500; }
 .scope-header { padding: 12px 16px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; border-bottom: 1px solid var(--border); }
 .scope-body { padding: 12px 16px; }
 .scope-body ul { margin: 0; padding-left: 18px; font-size: 13px; }
@@ -3859,6 +3897,7 @@ footer { padding: 20px 32px 40px; color: var(--muted); font-size: 12px; border-t
       <option value="partial">Partially mitigated only</option>
       <option value="secure">Secure / enforced only</option>
       <option value="unknown">Unclassified only</option>
+      <option value="not-configured">Not configured only</option>
     </select>
   </div>
   <div id="policies-container"></div>
@@ -3899,6 +3938,12 @@ footer { padding: 20px 32px 40px; color: var(--muted); font-size: 12px; border-t
   actually applies on an endpoint. Use <code>gpresult /h</code> or <code>Get-GPResultantSetOfPolicy</code> for
   endpoint-specific proof. Rows marked "Evaluation failed" could not be checked at all (even after retries) and
   are gaps in this evidence set, not confirmed absence of a policy.
+  <br /><br />
+  The Group Policy tab lists every GPO in the domain. The checklist on each GPO shows every setting this tool
+  tracks (currently SMB signing and the LAN Manager authentication level): a green, checked chip means the GPO
+  explicitly configures that setting, a grey, unchecked chip means it does not. The table below the checklist
+  drills into the configured settings only, together with the GPO's structural scope and security filtering.
+  The "Relevant-GPO-*.csv" evidence files still cover only the subset of GPOs that configure a tracked setting.
 </footer>
 
 <script>
@@ -3915,12 +3960,13 @@ function esc(s) {
     .replaceAll('"', '&quot;');
 }
 
-const severityOrder = { secure: 0, partial: 1, insecure: 2, unknown: 3 };
+const severityOrder = { secure: 0, partial: 1, insecure: 2, unknown: 3, 'not-configured': 4 };
 const severityLabel = {
   secure: 'Secure / enforced',
   partial: 'Partially mitigated',
   insecure: 'Insecure',
-  unknown: 'Unclassified'
+  unknown: 'Unclassified',
+  'not-configured': 'Not configured'
 };
 
 function badge(sev, text) {
@@ -4019,24 +4065,57 @@ function renderOverview() {
     '</div>';
 }
 
+function checklistChip(f) {
+  const mark = f.configured ? '&#10003;' : '&ndash;';
+  const cls = f.configured ? 'is-set' : 'is-unset';
+  const title = f.category + ': ' + f.setting + ' - ' +
+    (f.configured ? (f.label + (f.interpretation ? ' (' + f.interpretation + ')' : '')) : 'not configured in this GPO');
+  return '<span class="check-chip ' + cls + '" title="' + esc(title) + '"><span class="chip-mark">' + mark + '</span>' + esc(f.setting) + '</span>';
+}
+
 function renderPolicies(filterText, severityFilter) {
   const container = document.getElementById('policies-container');
   const term = filterText.trim().toLowerCase();
   let html = '';
 
+  const totalGpos = data.gpos.length;
+  const configuredGpoCount = data.gpos.filter(g => g.findings.some(f => f.configured)).length;
+  html += '<p class="muted">Showing all ' + totalGpos + ' GPO(s) in the domain, whether or not they configure a tracked setting. ' +
+    configuredGpoCount + ' of them explicitly configure at least one tracked setting.</p>';
+
   data.gpos.forEach(gpo => {
-    let findings = gpo.findings;
-    if (severityFilter !== 'all') findings = findings.filter(f => f.severity === severityFilter);
-    if (findings.length === 0) return;
+    // The full tracked-setting catalog for this GPO, in a fixed order, so
+    // every GPO block shows the same checklist: green/checked where the
+    // GPO configures that setting, grey/dash where it does not.
+    const findings = gpo.findings;
+
+    const filteredFindings = severityFilter === 'all'
+      ? findings
+      : findings.filter(f => f.severity === severityFilter);
+    if (filteredFindings.length === 0) return;
 
     const matchesText = !term ||
       gpo.gpoName.toLowerCase().includes(term) ||
       findings.some(f => (f.category + ' ' + f.setting).toLowerCase().includes(term));
     if (!matchesText) return;
 
-    const findingsHtml = findings.map(f =>
-      '<tr><td>' + esc(f.category) + '</td><td>' + esc(f.setting) + '</td><td><code>' + esc(f.registryData) + '</code></td><td>' + badge(f.severity, f.label) + '</td><td>' + esc(f.interpretation) + '</td></tr>'
-    ).join('');
+    const checklistHtml = findings.map(checklistChip).join('');
+
+    // The detail table drills into what is actually configured. With no
+    // severity filter applied it only lists the configured settings (the
+    // checklist above already communicates the not-configured ones); a
+    // specific severity/status filter (including "Not configured") shows
+    // exactly the matching rows instead.
+    const detailFindings = severityFilter === 'all'
+      ? findings.filter(f => f.configured)
+      : filteredFindings;
+
+    const findingsHtml = detailFindings.length
+      ? '<table class="findings-table"><thead><tr><th>Category</th><th>Setting</th><th>Value</th><th>Status</th><th>Interpretation</th></tr></thead><tbody>' +
+        detailFindings.map(f =>
+          '<tr><td>' + esc(f.category) + '</td><td>' + esc(f.setting) + '</td><td><code>' + esc(f.registryData) + '</code></td><td>' + badge(f.severity, f.label) + '</td><td>' + esc(f.interpretation) + '</td></tr>'
+        ).join('') + '</tbody></table>'
+      : '<p class="muted">No settings from the tracked catalog are explicitly configured in this GPO.</p>';
 
     const scopeHtml = gpo.structuralScope.length
       ? gpo.structuralScope.map(s =>
@@ -4059,9 +4138,10 @@ function renderPolicies(filterText, severityFilter) {
       : '';
 
     html +=
-      '<details class="gpo-block"><summary><span class="gpo-name">' + esc(gpo.gpoName) + '</span><span class="gpo-status muted">' + esc(gpo.gpoStatus) + '</span></summary>' +
+      '<details class="gpo-block" open><summary><span class="gpo-name">' + esc(gpo.gpoName) + '</span><span class="gpo-status muted">' + esc(gpo.gpoStatus) + '</span></summary>' +
       '<div class="gpo-body">' +
-      '<table class="findings-table"><thead><tr><th>Category</th><th>Setting</th><th>Value</th><th>Status</th><th>Interpretation</th></tr></thead><tbody>' + findingsHtml + '</tbody></table>' +
+      '<div class="gpo-checklist">' + checklistHtml + '</div>' +
+      findingsHtml +
       '<div class="gpo-columns">' +
       '<div><h4>Applies at (structural scope)</h4><ul>' + scopeHtml + '</ul></div>' +
       '<div><h4>Security filtering (Apply permission)</h4><ul>' + filteringHtml + '</ul></div>' +

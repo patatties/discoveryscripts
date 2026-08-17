@@ -150,7 +150,7 @@ param (
     [Parameter()]
     [ValidateNotNullOrEmpty()]
     [string]$OutputPath = (
-        Join-Path -Path $PWD -ChildPath (
+        Join-Path -Path (Join-Path $env:SystemDrive "temp") -ChildPath (
             "GPO-Security-Evidence-{0}" -f (Get-Date -Format "yyyyMMdd-HHmmss")
         )
     ),
@@ -201,6 +201,12 @@ param (
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = "Stop"
+
+# Resolve to an absolute path up front (independent of the current working
+# directory) so every message printed later - including the final "your
+# evidence is here" banner - always shows an unambiguous, full path, even
+# when the caller passes a relative -OutputPath.
+$OutputPath = [System.IO.Path]::GetFullPath($OutputPath)
 
 ###########################################################################
 # Helper functions
@@ -1055,6 +1061,27 @@ function New-AccountCheck {
         note           = $Note
         csv            = $CsvName
     }
+}
+
+###########################################################################
+# Validate elevation
+###########################################################################
+
+$CurrentPrincipal = New-Object System.Security.Principal.WindowsPrincipal(
+    [System.Security.Principal.WindowsIdentity]::GetCurrent()
+)
+
+if (
+    -not $CurrentPrincipal.IsInRole(
+        [System.Security.Principal.WindowsBuiltInRole]::Administrator
+    )
+) {
+    throw (
+        "This script must be run from an elevated PowerShell session " +
+        "(Run as Administrator). Some of the AD/GPO evidence collected " +
+        "here requires administrative rights and fails with unclear " +
+        "errors otherwise."
+    )
 }
 
 ###########################################################################
@@ -5100,6 +5127,23 @@ renderPasswordPolicy();
 
     Write-AuditLog "Evidence collection completed successfully."
     Write-AuditLog "Evidence directory: $OutputPath"
+
+    #######################################################################
+    # Make the output location unmistakable
+    #######################################################################
+
+    $BannerRule = "=" * 78
+
+    Write-Host ""
+    Write-Host $BannerRule -ForegroundColor Green
+    Write-Host "  EVIDENCE COLLECTION COMPLETE" -ForegroundColor Green
+    Write-Host $BannerRule -ForegroundColor Green
+    Write-Host "  Evidence folder : $OutputPath"
+    Write-Host "  Dashboard       : $DashboardHtmlPath"
+    Write-Host "  Summary         : $SummaryPath"
+    Write-Host "  Hash manifest   : $HashManifestPath"
+    Write-Host $BannerRule -ForegroundColor Green
+    Write-Host ""
 }
 catch {
     Write-AuditLog `

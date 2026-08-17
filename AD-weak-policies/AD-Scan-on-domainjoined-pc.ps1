@@ -838,8 +838,16 @@ function Get-WellKnownSidCatalog {
           - Domain-relative RIDs (matched against "<domain SID>-nnn").
         Keyed by the RID/suffix number; entries also carry which scope
         (Local, Domain, Both) they are meaningful for.
+
+        Intentionally a plain (non-ordered) hashtable, not [ordered]: an
+        [ordered]@{} is a System.Collections.Specialized.OrderedDictionary,
+        which - confusingly - also has a *positional* int indexer. Indexing
+        it with an Int32 key (e.g. $dict[544]) silently binds to that
+        positional overload instead of the key lookup and returns $null
+        rather than the intended value. A plain Hashtable has no such
+        ambiguity, so int keys index correctly here.
     #>
-    return [ordered]@{
+    return @{
         544 = @{ Name = "Administrators"; Scope = "Both"; Severity = "critical"; Baseline = "Expected for a small, documented set of administrators only."
                  Risk = "Full local administrative control: install software/drivers, read any file, modify any account, disable security tooling, and impersonate any locally logged-on user."
                  Remediation = "Remove standard users from this group; use Just-In-Time / Just-Enough-Admin (LAPS, PAW, PIM) instead of standing membership." }
@@ -981,7 +989,9 @@ function Get-NameBasedPrivilegedGroupCatalog {
 }
 
 function Get-UacFlagCatalog {
-    return [ordered]@{
+    # Plain (non-ordered) hashtable - see the comment in
+    # Get-WellKnownSidCatalog about [ordered]@{} + integer keys.
+    return @{
         64       = @{ Name = "PASSWD_NOTREQD"; Severity = "high"; Note = "Windows will accept a blank password for this account." }
         128      = @{ Name = "ENCRYPTED_TEXT_PWD_ALLOWED"; Severity = "critical"; Note = "The password is stored using reversible encryption - effectively plaintext-equivalent on the domain controller." }
         524288   = @{ Name = "TRUSTED_FOR_DELEGATION"; Severity = "critical"; Note = "Unconstrained delegation: any service this account authenticates to can capture and replay its full Kerberos TGT to impersonate it anywhere in the domain." }
@@ -1078,16 +1088,55 @@ function Get-LocalGroupCatalog {
         $Groups.Add([PSCustomObject]@{
             Name    = $GroupName
             Sid     = $GroupSid
-            Members = @($Members)
+            Members = $Members.ToArray()
         })
     }
 
-    return @($Groups)
+    # .ToArray(), not @(...): wrapping a List[T] directly in @() throws
+    # "Argument types do not match" on some recent PowerShell 5.1 builds.
+    return $Groups.ToArray()
 }
 
 ###########################################################################
 # Active Directory ACL scanning
 ###########################################################################
+
+function Get-KnownAceObjectTypeCatalog {
+    <#
+        Specific, individually-verified ObjectType GUIDs that would
+        otherwise fall into the generic "specific extended right" / "write
+        a specific property" buckets below. Two of these (Apply Group
+        Policy, Change Password) are universal Windows defaults present on
+        essentially every AD domain and are not meaningful findings; the
+        rest are genuinely worth calling out by name instead of leaving as
+        an unlabeled GUID. Values were confirmed against a live directory's
+        schema/Extended-Rights container, not guessed.
+    #>
+    return @{
+        "edacfd8f-ffb3-11d1-b41d-00a0c968f939" = @{ Name = "Apply Group Policy"; Kind = "ExtendedRight"; Suppress = $true
+            Severity = ""; Baseline = ""; Risk = ""; Remediation = "" }
+        "ab721a53-1e2f-11d0-9819-00aa0040529b" = @{ Name = "Change Password"; Kind = "ExtendedRight"; Suppress = $false; Severity = "info"
+            Baseline = "Standard Windows default - typically granted broadly (often to Everyone) to support ordinary self-service 'know the current password, set a new one' changes."
+            Risk = "Minimal - this only allows changing a password when the current password is already known; it is not a password-reset right."
+            Remediation = "No action needed; this is expected on essentially every AD domain." }
+        "bf967950-0de6-11d0-a285-00aa003049e2" = @{ Name = "Write 'description' attribute"; Kind = "WriteProperty"; Suppress = $false; Severity = "info"
+            Baseline = "Standard Windows default - Authenticated Users can typically write the free-text 'description' attribute on many object classes."
+            Risk = "Minimal - limited to editing a cosmetic, free-text description field."
+            Remediation = "No action needed; commonly left at the Windows default." }
+        "05c74c5e-4deb-43b4-bd9f-86664c2a7fd5" = @{ Name = "Enable Per-User Reversibly Encrypted Password"; Kind = "ExtendedRight"; Suppress = $false; Severity = "high"
+            Baseline = "Not a universal default - review why this identity holds it here."
+            Risk = "Can flip the per-account 'store password using reversible encryption' setting for accounts within scope; once enabled, that account's password is stored in a form equivalent to plaintext on the domain controller after its next password change."
+            Remediation = "Remove this right from broad groups (Authenticated Users/Everyone/Domain Users); restrict to dedicated account-administration roles only." }
+        "280f369c-67c7-438e-ae98-1d46f3c6f541" = @{ Name = "Update Password Not Required Bit"; Kind = "ExtendedRight"; Suppress = $false; Severity = "high"
+            Baseline = "Not a universal default - review why this identity holds it here."
+            Risk = "Can flip the 'password not required' flag on accounts within scope; Windows will then accept a blank password for that account."
+            Remediation = "Remove this right from broad groups; restrict to dedicated account-administration roles only." }
+        "ccc2dc7d-a6ad-4a7a-8846-c04e3cc53501" = @{ Name = "Unexpire Password"; Kind = "ExtendedRight"; Suppress = $false; Severity = "medium"
+            Baseline = "Not a universal default - review why this identity holds it here."
+            Risk = "Can clear the 'password expired' state on accounts within scope, bypassing an administrator-forced password change."
+            Remediation = "Remove this right from broad groups; restrict to dedicated account-administration/helpdesk roles only." }
+    }
+}
 
 function Get-AceRiskClassification {
     param (
@@ -1156,7 +1205,17 @@ function Get-AceRiskClassification {
             Remediation = "Remove this ACE and replace it with the specific extended right actually required, if any."
         }
     }
+    $KnownObjectTypes = Get-KnownAceObjectTypeCatalog
+    $KnownEntry = if ($KnownObjectTypes.Contains($ObjectTypeString)) { $KnownObjectTypes[$ObjectTypeString] } else { $null }
+
     if ($Rights.HasFlag($ExtendedRight)) {
+        if ($KnownEntry -and $KnownEntry.Kind -eq "ExtendedRight") {
+            if ($KnownEntry.Suppress) { return $null }
+            return [PSCustomObject]@{
+                Severity = $KnownEntry.Severity; Label = $KnownEntry.Name; Baseline = $KnownEntry.Baseline
+                Risk = $KnownEntry.Risk; Remediation = $KnownEntry.Remediation
+            }
+        }
         return [PSCustomObject]@{
             Severity = "medium"; Label = "Specific extended right"
             Risk = "Granted a specific extended right on this object (see the object-type GUID in the evidence column). Impact depends on which right this is."
@@ -1164,6 +1223,13 @@ function Get-AceRiskClassification {
         }
     }
     if ($Rights.HasFlag([System.DirectoryServices.ActiveDirectoryRights]::WriteProperty)) {
+        if ($KnownEntry -and $KnownEntry.Kind -eq "WriteProperty") {
+            if ($KnownEntry.Suppress) { return $null }
+            return [PSCustomObject]@{
+                Severity = $KnownEntry.Severity; Label = $KnownEntry.Name; Baseline = $KnownEntry.Baseline
+                Risk = $KnownEntry.Risk; Remediation = $KnownEntry.Remediation
+            }
+        }
         return [PSCustomObject]@{
             Severity = "medium"; Label = "Write a specific property"
             Risk = "Can modify a specific attribute of this object (see evidence for the attribute GUID). Impact depends on which attribute this is."
@@ -1221,7 +1287,7 @@ function Get-AclFindingsForObject {
             if ($OwnerRef -and $TargetSidSet.Contains($OwnerRef.Value)) {
                 $Results.Add([PSCustomObject]@{
                     ObjectLabel = $ObjectLabel; ObjectKind = $ObjectKind; Dn = $DistinguishedName
-                    Right = "Owner"; Severity = "high"
+                    Right = "Owner"; Severity = "high"; Baseline = ""
                     Risk = "You (or a group you belong to) own this object. An object's owner can always grant themselves any permission on it, even with no explicit access rule present."
                     Remediation = "Confirm ownership is expected; if not, have an administrator take ownership back and re-apply the intended permissions."
                     Evidence = "Owner SID: $($OwnerRef.Value)"
@@ -1242,6 +1308,7 @@ function Get-AclFindingsForObject {
             $Results.Add([PSCustomObject]@{
                 ObjectLabel = $ObjectLabel; ObjectKind = $ObjectKind; Dn = $DistinguishedName
                 Right = $Classification.Label; Severity = $Classification.Severity
+                Baseline = $(if ($Classification.PSObject.Properties.Match("Baseline").Count) { $Classification.Baseline } else { "" })
                 Risk = $Classification.Risk; Remediation = $Classification.Remediation
                 Evidence = "Trustee SID: $TrusteeSid; Rights: $($Rule.ActiveDirectoryRights); ObjectType GUID: $($Rule.ObjectType)"
             })
@@ -1250,14 +1317,16 @@ function Get-AclFindingsForObject {
     catch {
         $Results.Add([PSCustomObject]@{
             ObjectLabel = $ObjectLabel; ObjectKind = $ObjectKind; Dn = $DistinguishedName
-            Right = "(scan failed)"; Severity = "unknown"
+            Right = "(scan failed)"; Severity = "unknown"; Baseline = ""
             Risk = "Could not read the security descriptor for this object: $($_.Exception.Message)"
             Remediation = "Re-run with an account that has read access to this object, or investigate the connectivity/permission error."
             Evidence = $_.Exception.Message
         })
     }
 
-    return @($Results)
+    # .ToArray(), not @(...): wrapping a List[T] directly in @() throws
+    # "Argument types do not match" on some recent PowerShell 5.1 builds.
+    return $Results.ToArray()
 }
 
 function Get-GpoAclFindings {
@@ -1300,7 +1369,9 @@ function Get-GpoAclFindings {
 
             foreach ($Finding in $Findings) {
                 if ($Finding.Severity -eq "unknown") { continue }
-                $Finding.Risk = $Finding.Risk + " If this GPO is linked to any OU, this lets you modify settings that apply to every computer/user in that scope - including deploying a startup/logon script for code execution."
+                if ($Finding.Severity -notin @("info", "secure")) {
+                    $Finding.Risk = $Finding.Risk + " If this GPO is linked to any OU, this lets you modify settings that apply to every computer/user in that scope - including deploying a startup/logon script for code execution."
+                }
                 $Results.Add($Finding)
             }
         }
@@ -1315,7 +1386,9 @@ function Get-GpoAclFindings {
         })
     }
 
-    return @($Results)
+    # .ToArray(), not @(...): wrapping a List[T] directly in @() throws
+    # "Argument types do not match" on some recent PowerShell 5.1 builds.
+    return $Results.ToArray()
 }
 
 function Get-OuAclFindings {
@@ -1371,7 +1444,9 @@ function Get-OuAclFindings {
         })
     }
 
-    return @($Results)
+    # .ToArray(), not @(...): wrapping a List[T] directly in @() throws
+    # "Argument types do not match" on some recent PowerShell 5.1 builds.
+    return $Results.ToArray()
 }
 
 ###########################################################################
@@ -1412,8 +1487,6 @@ function New-Finding {
 ###########################################################################
 # MAIN
 ###########################################################################
-
-$SeverityRank = @{ critical = 0; high = 1; medium = 2; low = 3; info = 4; secure = 5; unknown = 6 }
 
 Write-Host ""
 Write-Host "=" * 78 -ForegroundColor Cyan
@@ -1511,6 +1584,7 @@ try {
     $TargetAccount = $null
     $TokenGroupSids = @()
     $TargetSidSet = New-Object System.Collections.Generic.HashSet[string]
+    $PrimarySid = $null
 
     if (-not $IsDomainJoined) {
         $Gaps.Add([PSCustomObject]@{ Area = "Domain sections"; Reason = "This computer does not appear to be domain-joined; only local-machine sections were evaluated." })
@@ -1544,6 +1618,7 @@ try {
                 foreach ($Sid in $TokenGroupSids) { [void]$TargetSidSet.Add($Sid) }
                 [void]$TargetSidSet.Add("S-1-1-0")   # Everyone
                 [void]$TargetSidSet.Add("S-1-5-11")  # Authenticated Users
+                $PrimarySid = $TargetAccount.ObjectSid
             }
         }
         catch {
@@ -1566,6 +1641,7 @@ try {
             foreach ($Group in $WindowsIdentity.Groups) {
                 [void]$TargetSidSet.Add($Group.Value)
             }
+            $PrimarySid = $WindowsIdentity.User.Value
             Write-ScanLog "Domain lookup unavailable - using the current Windows logon token's SID set instead ($($TargetSidSet.Count) SIDs)."
         }
         catch {
@@ -1584,7 +1660,6 @@ try {
         $NameCatalog = Get-NameBasedPrivilegedGroupCatalog
         $DomainSidPrefix = $TargetAccount.ObjectSid.Substring(0, $TargetAccount.ObjectSid.LastIndexOf("-"))
 
-        $MatchedRids = New-Object System.Collections.Generic.HashSet[int]
         $UnmatchedSids = New-Object System.Collections.Generic.List[string]
 
         foreach ($Sid in $TokenGroupSids) {
@@ -1702,7 +1777,7 @@ try {
                     $Gaps.Add([PSCustomObject]@{ Area = "AD Object Permissions: $($ObjectSpec.Label)"; Reason = $Result.Risk })
                     continue
                 }
-                if ($ObjectSpec.Kind -eq "AdminSDHolder") {
+                if ($ObjectSpec.Kind -eq "AdminSDHolder" -and $Result.Severity -notin @("info", "secure")) {
                     $Result.Risk = $Result.Risk + " This is the AdminSDHolder template object - any right here propagates to, and persists on, every current and future protected (privileged) account/group roughly every 60 minutes via SDProp, making it a powerful persistence/backdoor mechanism."
                 }
                 $AclFindings.Add($Result)
@@ -1735,7 +1810,7 @@ try {
 
         foreach ($AclFinding in $AclFindings) {
             $Findings.Add((New-Finding -Scope "Domain" -Category "AD Object Permissions" -Item "$($AclFinding.ObjectLabel) - $($AclFinding.Right)" -Status $AclFinding.Right `
-                -Severity $AclFinding.Severity -Risk $AclFinding.Risk -Remediation $AclFinding.Remediation -Evidence $AclFinding.Evidence))
+                -Severity $AclFinding.Severity -Baseline $AclFinding.Baseline -Risk $AclFinding.Risk -Remediation $AclFinding.Remediation -Evidence $AclFinding.Evidence))
         }
 
         if ($AclFindings.Count -eq 0) {
@@ -1784,8 +1859,7 @@ try {
                     Remediation = "Review what access this custom group actually grants on this machine and confirm it is expected." }
             }
 
-            $Via = if ($MatchedMember.Sid -eq $TargetAccount.ObjectSid) { "Direct" } elseif ($TargetAccount -and $MatchedMember.Sid -eq $TargetAccount.ObjectSid) { "Direct" } else { "Via domain group: $(Resolve-SidDisplayName -Sid $MatchedMember.Sid)" }
-            if (-not $TargetAccount) { $Via = "Direct (local identity match)" }
+            $Via = if ($PrimarySid -and $MatchedMember.Sid -eq $PrimarySid) { "Direct" } else { "Via domain group: $(Resolve-SidDisplayName -Sid $MatchedMember.Sid)" }
 
             $Finding = New-Finding -Scope "Local" -Category "Local Group Membership" -Item $Group.Name -Status "Member" `
                 -Severity $Info.Severity -Baseline $Info.Baseline -Risk $Info.Risk -Remediation $Info.Remediation -Evidence "$Via; group SID: $($Group.Sid)"
@@ -1854,7 +1928,7 @@ try {
             }
         }
 
-        @($UserRightsRows) | Export-Csv -Path (Join-Path $CsvDirectory "User-Rights-Assignment.csv") -NoTypeInformation -Encoding UTF8
+        $UserRightsRows.ToArray() | Export-Csv -Path (Join-Path $CsvDirectory "User-Rights-Assignment.csv") -NoTypeInformation -Encoding UTF8
     }
 
     #-----------------------------------------------------------------
@@ -1902,7 +1976,7 @@ try {
     #-----------------------------------------------------------------
 
     $Findings.ToArray() | Export-Csv -Path (Join-Path $CsvDirectory "All-Findings.csv") -NoTypeInformation -Encoding UTF8
-    @($Gaps) | Export-Csv -Path (Join-Path $CsvDirectory "Evidence-Gaps.csv") -NoTypeInformation -Encoding UTF8
+    $Gaps.ToArray() | Export-Csv -Path (Join-Path $CsvDirectory "Evidence-Gaps.csv") -NoTypeInformation -Encoding UTF8
 
     #-----------------------------------------------------------------
     # Build dashboard JSON
@@ -1965,7 +2039,7 @@ try {
             }
         )
         localAdministrators = @($LocalAdministratorsMembers | ForEach-Object { [PSCustomObject]@{ name = $_.Name; sid = $_.Sid; class = $_.Class; source = $_.Source } })
-        userRights    = @($UserRightsRows)
+        userRights    = $UserRightsRows.ToArray()
         livePrivileges = [PSCustomObject]@{
             available = $LivePrivileges.Available
             reason    = $LivePrivileges.Reason
@@ -2242,7 +2316,7 @@ function activateTab(name) {
 document.querySelectorAll('.tab-btn').forEach(btn => btn.addEventListener('click', () => activateTab(btn.dataset.tab)));
 
 function openFinding(id) {
-  const el = document.getElementById('finding-' + id);
+  const el = document.getElementById('all-' + id);
   if (el) { el.open = true; el.scrollIntoView({ behavior: 'smooth', block: 'start' }); }
 }
 
@@ -2291,13 +2365,11 @@ function renderOverview() {
   const metric = (value, label, sub, tone) => '<div class="ov-metric' + (tone ? ' ov-' + tone : '') + '">' +
     '<div class="ov-metric-val">' + esc(value) + '</div><div class="ov-metric-lbl">' + esc(label) + '</div>' +
     (sub ? '<div class="ov-metric-sub">' + esc(sub) + '</div>' : '') + '</div>';
-  metricsHtml: {
-    html += metric(sc.elevated ? 'Yes' : 'No', 'Running elevated', null, sc.elevated ? 'ok' : 'warn');
-    html += metric(sc.domainAvailable ? 'Yes' : 'No', 'Domain contacted', sc.domainAvailable ? data.domainController : '', sc.domainAvailable ? 'ok' : 'bad');
-    html += metric(s.secure, 'Positive / secure findings', null, 'ok');
-    html += metric(s.gaps, 'Evidence gaps', 'see Evidence & Gaps tab', s.gaps > 0 ? 'warn' : 'ok');
-    html += metric(sc.scannedOuAcls ? 'Yes' : 'No', 'Full OU ACL sweep run', sc.scannedOuAcls ? '' : 'run with -ScanOuAcls', null);
-  }
+  html += metric(sc.elevated ? 'Yes' : 'No', 'Running elevated', null, sc.elevated ? 'ok' : 'warn');
+  html += metric(sc.domainAvailable ? 'Yes' : 'No', 'Domain contacted', sc.domainAvailable ? data.domainController : '', sc.domainAvailable ? 'ok' : 'bad');
+  html += metric(s.secure, 'Positive / secure findings', null, 'ok');
+  html += metric(s.gaps, 'Evidence gaps', 'see Evidence & Gaps tab', s.gaps > 0 ? 'warn' : 'ok');
+  html += metric(sc.scannedOuAcls ? 'Yes' : 'No', 'Full OU ACL sweep run', sc.scannedOuAcls ? '' : 'run with -ScanOuAcls', null);
   html += '</div>';
 
   const flagged = (data.findings || []).filter(f => f.severity !== 'secure' && f.severity !== 'info' && f.severity !== 'unknown')
@@ -2449,7 +2521,7 @@ function renderUserRights() {
   const granted = rows.filter(r => r.Granted).sort((a, b) => severityRank[a.Severity] - severityRank[b.Severity]);
   const notGranted = rows.filter(r => !r.Granted).sort((a, b) => a.Right.localeCompare(b.Right));
 
-  const rowHtml = r => '<tr><td><code>' + esc(r.Right) + '</code></td><td>' + sevBadge(r.Severity) + '<td>' + (r.Granted ? 'Yes' : 'No') + '</td><td>' + esc(r.GrantedVia) + '</td><td>' + esc(r.Risk) + '</td><td>' + esc(r.Remediation) + '</td></tr>';
+  const rowHtml = r => '<tr><td><code>' + esc(r.Right) + '</code></td><td>' + sevBadge(r.Severity) + '</td><td>' + (r.Granted ? 'Yes' : 'No') + '</td><td>' + esc(r.GrantedVia) + '</td><td>' + esc(r.Risk) + '</td><td>' + esc(r.Remediation) + '</td></tr>';
 
   html += '<div class="ov-h">Granted to this identity (' + granted.length + ')</div>';
   html += '<div class="table-wrap"><table class="data-table"><thead><tr><th>Right</th><th>Severity</th><th>Granted</th><th>Via</th><th>Risk</th><th>Remediation</th></tr></thead><tbody>' +

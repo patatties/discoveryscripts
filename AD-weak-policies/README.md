@@ -55,7 +55,7 @@ with the error captured in the `Status` column.
 - PowerShell Remoting (WinRM) enabled and reachable on the target servers
 - Network connectivity to the target servers
 
-### `get-DC-evidence-security-checks.ps1` — GPO evidence + audit dashboard
+### `AD-Scan-Admin-on-DC.ps1` — GPO evidence + audit dashboard
 
 The heavy lifter. Run this from a **domain controller or a management system with
 the `ActiveDirectory` and `GroupPolicy` modules**. It exports audit-grade evidence
@@ -103,19 +103,96 @@ the script works across domains with mixed-language systems.
 
 ```powershell
 # Default run in the current directory
-.\get-DC-evidence-security-checks.ps1
+.\AD-Scan-Admin-on-DC.ps1
 
 # Custom output folder and explicit DC
-.\get-DC-evidence-security-checks.ps1 -OutputPath C:\AuditEvidence\GPO -DomainController DC01.contoso.com
+.\AD-Scan-Admin-on-DC.ps1 -OutputPath C:\AuditEvidence\GPO -DomainController DC01.contoso.com
 
 # Skip (potentially slow) group membership resolution
-.\get-DC-evidence-security-checks.ps1 -ResolveGroupMembership:$false
+.\AD-Scan-Admin-on-DC.ps1 -ResolveGroupMembership:$false
 ```
 
 > **Note:** The dashboard surfaces *configured* settings, structural scope, and
 > security filtering — it does **not** compute final effective (resultant) policy.
 > For computer-specific proof, supplement it with `gpresult.exe /h GPResult.html`
 > or `Get-GPResultantSetOfPolicy`.
+
+### `AD-Scan-on-domainjoined-pc.ps1` — "What can I actually do?" self/account privilege report
+
+Run this from **any domain-joined workstation or member server, as any authenticated
+domain user** — it does not require local admin or Domain Admin rights, though some
+sections return more when run elevated. It is entirely **read-only**: it never
+changes group membership, permissions, or account settings. Where it fits relative
+to the other two scripts: those sweep servers/GPOs from an admin vantage point; this
+one answers "what can *this one account* actually do, here and in the domain?" from
+an ordinary user's vantage point.
+
+It builds a single-file interactive HTML dashboard that separates what's *normal*
+for a standard account from what's *higher than it should be*, with a plain-English
+risk explanation and a remediation for every finding — including a set of positive
+("secure") findings when nothing unusual is found.
+
+**Credentials:** run it and you'll be prompted once for domain credentials; press
+Cancel or leave the username blank to scan your current, already-logged-on identity
+instead (no password used in that case). Pass `-Credential` to scan a specific
+account non-interactively, or `-NoCredentialPrompt` to always use the current
+session without any prompt. A supplied password is only ever held in memory for
+the life of the script.
+
+It covers:
+- **Local machine** — group membership (matched by SID, so nested domain-group-in-
+  local-group membership is caught even without logging on as the account), the
+  full local Administrators membership for context, the local User Rights
+  Assignment policy (via `secedit`, mapped to the account's SID set), and, for the
+  account actually running the session, its live/currently-enabled token
+  privileges (via a small P/Invoke helper — language-independent, unlike parsing
+  `whoami /priv`)
+- **Domain group membership** — every privileged group the account belongs to,
+  resolved through nested groups by Active Directory itself (the constructed
+  `tokenGroups` attribute), matched against a catalog of well-known privileged
+  group SIDs/RIDs plus a few commonly-privileged named groups (DnsAdmins, Exchange
+  groups)
+- **Account configuration** — UAC flags (password never expires, reversible
+  encryption, delegation, pre-authentication), a stale/orphaned `adminCount`
+  check, Service Principal Names (Kerberoastable), and constrained-delegation
+  targets
+- **AD object permissions (ACLs)** — dangerous rights (GenericAll/GenericWrite/
+  WriteDacl/WriteOwner, the two DCSync replication rights, password-reset rights,
+  and a handful of other specific extended rights) the account holds, directly or
+  via group membership, on the domain root, AdminSDHolder, every existing Group
+  Policy Object (edit rights), and its own user/computer objects. A handful of
+  universal Windows defaults (Apply Group Policy, Change Password, writing the
+  `description` attribute) are recognized and reported as expected baseline
+  instead of noise. Pass `-ScanOuAcls` to additionally sweep every OU in the
+  domain for the same rights (slower; capped by `-MaxOusToScanAcls`)
+
+Anything the scan could not read (access denied, secedit needing elevation, an
+unreachable domain controller) is recorded as an explicit evidence gap on its own
+dashboard tab rather than silently skipped.
+
+**Common parameters** (all optional):
+
+| Parameter | Default | Purpose |
+|---|---|---|
+| `-Credential` | prompt | Domain account to scan; Cancel/blank = current identity |
+| `-NoCredentialPrompt` | off | Skip the prompt, always use the current identity |
+| `-OutputPath` | `C:\temp\Privilege-Scan-<timestamp>` | Where evidence is written |
+| `-DomainController` | auto | Target a specific DC |
+| `-ScanOuAcls` | off | Also sweep every OU's ACL (slower) |
+| `-MaxOusToScanAcls` / `-MaxGposToScanAcls` | `300` / `500` | Caps for the OU/GPO ACL sweeps |
+
+**Examples**
+
+```powershell
+# Prompt for credentials (Cancel/blank = scan the current logon)
+.\AD-Scan-on-domainjoined-pc.ps1
+
+# Non-interactive, current identity only
+.\AD-Scan-on-domainjoined-pc.ps1 -NoCredentialPrompt
+
+# Scan a specific account and sweep every OU's ACL too
+.\AD-Scan-on-domainjoined-pc.ps1 -Credential (Get-Credential) -ScanOuAcls
+```
 
 ## Use cases
 
